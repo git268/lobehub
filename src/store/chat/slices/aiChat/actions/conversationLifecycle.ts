@@ -26,7 +26,7 @@ import { messageService } from '@/services/message';
 import { getAgentStoreState } from '@/store/agent';
 import { agentByIdSelectors, agentSelectors } from '@/store/agent/selectors';
 import { agentGroupByIdSelectors, getChatGroupStoreState } from '@/store/agentGroup';
-import { resolveCcResume } from '@/store/chat/slices/aiChat/actions/ccResume';
+import { resolveHeteroResume } from '@/store/chat/slices/aiChat/actions/heteroResume';
 import { type ChatStore } from '@/store/chat/store';
 import {
   createPendingCompressedGroup,
@@ -346,19 +346,35 @@ export class ConversationLifecycleActionImpl {
     // Per-agent heterogeneousProvider config takes priority over the global gateway mode.
     const agentConfig = agentSelectors.getAgentConfigById(agentId)(getAgentStoreState());
     const heterogeneousProvider = agentConfig?.agencyConfig?.heterogeneousProvider;
-    if (isDesktop && heterogeneousProvider?.type === 'claudecode') {
+    if (isDesktop && heterogeneousProvider?.type === 'claude-code') {
+      // Resolve cwd up-front so the new topic is bound to a project at
+      // creation time. Otherwise the row stays NULL until the post-execution
+      // metadata write — which never lands on cancel/error and meanwhile
+      // makes By-Project grouping miss the topic and `--resume` unsafe.
+      //
+      // Priority: topic-level cwd (once a topic is bound to a project) wins
+      // over the agent-level default. Without this, a topic pinned to dir A
+      // would silently execute under the agent's current default dir B and
+      // lose resume.
+      const existingTopic = operationContext.topicId
+        ? topicSelectors.getTopicById(operationContext.topicId)(this.#get())
+        : undefined;
+      const agentWorkingDirectory =
+        agentByIdSelectors.getAgentWorkingDirectoryById(agentId)(getAgentStoreState());
+      const workingDirectory = existingTopic?.metadata?.workingDirectory || agentWorkingDirectory;
+
       // Persist messages to DB first (same as client mode)
       let heteroData: SendMessageServerResponse | undefined;
       try {
-        const { model, provider } =
-          agentSelectors.getAgentConfigById(agentId)(getAgentStoreState());
+        const { model } = agentSelectors.getAgentConfigById(agentId)(getAgentStoreState());
         heteroData = await aiChatService.sendMessageInServer(
           {
             agentId: operationContext.agentId,
             groupId: operationContext.groupId ?? undefined,
-            newAssistantMessage: { model, provider: provider! },
+            newAssistantMessage: { model, provider: 'claude-code' },
             newTopic: !operationContext.topicId
               ? {
+                  metadata: workingDirectory ? { workingDirectory } : undefined,
                   title: message.slice(0, 20) || t('defaultTitle', { ns: 'topic' }),
                   topicMessageIds: messages.map((m) => m.id),
                 }
@@ -424,6 +440,13 @@ export class ConversationLifecycleActionImpl {
       // Complete sendMessage operation, start ACP execution as child operation
       this.#get().completeOperation(operationId);
 
+      // Clear editor temp state — the user's message is already persisted, so
+      // a later Stop click must NOT restore it into the input (would feel like
+      // the app re-sent the message). Client/Gateway paths clear this at
+      // line 684-686 after `sendMessageInServer` resolves, but the hetero
+      // branch returns early (line 498) and never reaches that clear.
+      this.#get().updateOperationMetadata(operationId, { inputEditorTempState: null });
+
       if (heteroData.topicId) this.#get().internal_updateTopicLoading(heteroData.topicId, true);
 
       // Start heterogeneous agent execution
@@ -438,21 +461,22 @@ export class ConversationLifecycleActionImpl {
 
       try {
         const { executeHeterogeneousAgent } = await import('./heterogeneousAgentExecutor');
-        const workingDirectory =
-          agentByIdSelectors.getAgentWorkingDirectoryById(agentId)(getAgentStoreState());
         // Extract imageList from the persisted user message (chatUploadFileList
         // may already be cleared by this point, so we read from DB instead)
         const userMsg = heteroData.messages.find((m: any) => m.id === heteroData.userMessageId);
         const persistedImageList = userMsg?.imageList;
 
-        // Read CC session ID from topic metadata for multi-turn resume.
-        // `resolveCcResume` drops the sessionId when the saved cwd doesn't
-        // match the current one, so CC doesn't emit
+        // Read heterogeneous-agent session id from topic metadata for multi-turn
+        // resume. `resolveHeteroResume` drops the sessionId when the saved cwd
+        // doesn't match the current one, so CC doesn't emit
         // "No conversation found with session ID".
         const topic = heteroContext.topicId
           ? topicSelectors.getTopicById(heteroContext.topicId)(this.#get())
           : undefined;
-        const { cwdChanged, resumeSessionId } = resolveCcResume(topic?.metadata, workingDirectory);
+        const { cwdChanged, resumeSessionId } = resolveHeteroResume(
+          topic?.metadata,
+          workingDirectory,
+        );
         if (cwdChanged) {
           antdMessage.info(t('heteroAgent.resumeReset.cwdChanged', { ns: 'chat' }));
         }
