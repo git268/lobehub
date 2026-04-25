@@ -8,6 +8,8 @@ import {
 } from '@/business/client/BusinessDesktopRoutes';
 import { dynamicElement, dynamicLayout, ErrorBoundary, redirectElement } from '@/utils/router';
 
+const agentChatElement = dynamicElement(() => import('@/routes/(main)/agent'), 'Desktop > Chat');
+const isDev = process.env.NODE_ENV === 'development';
 // Desktop router configuration (declarative mode)
 export const desktopRoutes: RouteObject[] = [
   {
@@ -22,8 +24,51 @@ export const desktopRoutes: RouteObject[] = [
           {
             children: [
               {
-                element: dynamicElement(() => import('@/routes/(main)/agent'), 'Desktop > Chat'),
-                index: true,
+                children: [
+                  {
+                    element: agentChatElement,
+                    index: true,
+                  },
+                  {
+                    children: [
+                      {
+                        element: agentChatElement,
+                        index: true,
+                      },
+                      {
+                        children: [
+                          {
+                            element: dynamicElement(
+                              () => import('@/routes/(main)/agent/[topicId]/page'),
+                              'Desktop > Chat > Topic > Page > Redirect',
+                            ),
+                            index: true,
+                          },
+                          {
+                            element: dynamicElement(
+                              () => import('@/routes/(main)/agent/[topicId]/page/[docId]'),
+                              'Desktop > Chat > Topic > Page > Doc',
+                            ),
+                            path: ':docId',
+                          },
+                        ],
+                        path: 'page',
+                      },
+                    ],
+                    path: ':topicId',
+                  },
+                ],
+                element: dynamicLayout(
+                  () => import('@/routes/(main)/agent/(chat)/_layout'),
+                  'Desktop > Chat > ChatLayout',
+                ),
+              },
+              {
+                element: dynamicElement(
+                  () => import('@/routes/(main)/agent/page'),
+                  'Desktop > Chat > Invalid Page Redirect',
+                ),
+                path: 'page',
               },
               {
                 element: dynamicElement(
@@ -45,6 +90,29 @@ export const desktopRoutes: RouteObject[] = [
                   'Desktop > Chat > Channel',
                 ),
                 path: 'channel',
+              },
+              {
+                children: [
+                  {
+                    element: dynamicElement(
+                      () => import('@/routes/(main)/agent/tasks'),
+                      'Desktop > Chat > Tasks',
+                    ),
+                    index: true,
+                  },
+                  {
+                    element: dynamicElement(
+                      () => import('@/routes/(main)/agent/tasks/[taskId]'),
+                      'Desktop > Chat > Task Detail',
+                    ),
+                    path: ':taskId',
+                  },
+                ],
+                element: dynamicLayout(
+                  () => import('@/routes/(main)/agent/tasks/_layout'),
+                  'Desktop > Chat > Tasks > Layout',
+                ),
+                path: 'tasks',
               },
             ],
             element: dynamicLayout(
@@ -514,6 +582,41 @@ export const desktopRoutes: RouteObject[] = [
         path: 'eval',
       },
 
+      // Tasks routes (cross-agent)
+      {
+        children: [
+          {
+            element: dynamicElement(() => import('@/routes/(main)/tasks'), 'Desktop > Tasks'),
+            index: true,
+          },
+        ],
+        element: dynamicLayout(
+          () => import('@/routes/(main)/tasks/_layout'),
+          'Desktop > Tasks > Layout',
+        ),
+        errorElement: <ErrorBoundary resetPath="/" />,
+        path: 'tasks',
+      },
+
+      // Task detail route (cross-agent entry — resolves by task identifier)
+      {
+        children: [
+          {
+            element: dynamicElement(
+              () => import('@/routes/(main)/task/[taskId]'),
+              'Desktop > Task Detail',
+            ),
+            path: ':taskId',
+          },
+        ],
+        element: dynamicLayout(
+          () => import('@/routes/(main)/task/_layout'),
+          'Desktop > Task > Layout',
+        ),
+        errorElement: <ErrorBoundary resetPath="/tasks" />,
+        path: 'task',
+      },
+
       // Pages routes
       {
         children: [
@@ -536,6 +639,18 @@ export const desktopRoutes: RouteObject[] = [
         errorElement: <ErrorBoundary />,
         path: 'page',
       },
+
+      ...(isDev
+        ? [
+            {
+              element: dynamicElement(
+                () => import('@/routes/(main)/devtools'),
+                'Desktop > Devtools',
+              ),
+              path: 'devtools',
+            },
+          ]
+        : []),
 
       // Default route - home page (handled by persistent layout)
       {

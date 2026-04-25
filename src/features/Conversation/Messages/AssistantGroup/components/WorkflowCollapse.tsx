@@ -1,5 +1,5 @@
 import { type ChatToolPayloadWithResult } from '@lobechat/types';
-import { Accordion, AccordionItem, Block, Flexbox, Icon, Text } from '@lobehub/ui';
+import { Accordion, AccordionItem, ActionIcon, Block, Flexbox, Icon, Text } from '@lobehub/ui';
 import { cssVar } from 'antd-style';
 import { AlertTriangle, Check, HandIcon, Maximize2, Minimize2, X } from 'lucide-react';
 import { AnimatePresence, m as motion } from 'motion/react';
@@ -39,12 +39,19 @@ const WORKFLOW_EXPAND_TOGGLE_TRANSITION = {
   ease: [0.4, 0, 0.2, 1],
 } as const;
 
+export type WorkflowExpandLevel = 'collapsed' | 'semi' | 'full';
+
 interface WorkflowCollapseProps {
   /** Assistant group message id (for generation state) */
   assistantMessageId: string;
   blocks: RenderableAssistantContentBlock[];
-  /** Default expansion state while the workflow is still streaming. Pending intervention always expands. */
-  defaultStreamingExpanded?: boolean;
+  /**
+   * Fixed default expand level. When set, overrides the built-in auto
+   * behavior (expand while streaming, collapse after completion) for both
+   * the initial state and resets. Users can still toggle locally.
+   * Undefined = legacy auto behavior. Pending intervention still forces open.
+   */
+  defaultWorkflowExpandLevel?: WorkflowExpandLevel;
   disableEditing?: boolean;
   workflowChromeComplete?: boolean;
 }
@@ -115,7 +122,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
   ({
     assistantMessageId,
     blocks,
-    defaultStreamingExpanded = true,
+    defaultWorkflowExpandLevel,
     disableEditing,
     workflowChromeComplete = false,
   }) => {
@@ -145,11 +152,14 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
       [blocks],
     );
     const durationText = totalWorkflowMs > 0 ? formatReasoningDuration(totalWorkflowMs) : undefined;
-    const streamingDefaultExpanded = defaultStreamingExpanded || pendingInterventionPresent;
+    const hasExternalDefault = defaultWorkflowExpandLevel !== undefined;
+    const streamingInitialLevel: WorkflowExpandLevel = defaultWorkflowExpandLevel ?? 'semi';
+    const completionInitialLevel: WorkflowExpandLevel = defaultWorkflowExpandLevel ?? 'collapsed';
 
-    const [expandLevel, setExpandLevel] = useState<'collapsed' | 'semi' | 'full'>(() =>
-      !allComplete && streamingDefaultExpanded ? 'semi' : 'collapsed',
-    );
+    const [expandLevel, setExpandLevel] = useState<WorkflowExpandLevel>(() => {
+      if (hasExternalDefault) return defaultWorkflowExpandLevel;
+      return allComplete ? 'collapsed' : 'semi';
+    });
     const userOpenedRef = useRef(false);
     const prevCompleteRef = useRef(allComplete);
 
@@ -159,14 +169,14 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
 
       if (!allComplete && wasComplete) {
         userOpenedRef.current = false;
-        setExpandLevel(streamingDefaultExpanded ? 'semi' : 'collapsed');
+        setExpandLevel(streamingInitialLevel);
         return;
       }
 
       if (allComplete && !wasComplete && !userOpenedRef.current && allTools.length > 0) {
-        setExpandLevel('collapsed');
+        setExpandLevel(completionInitialLevel);
       }
-    }, [allComplete, allTools.length, streamingDefaultExpanded]);
+    }, [allComplete, allTools.length, streamingInitialLevel, completionInitialLevel]);
 
     const streaming = !allComplete;
     const forceExpanded = streaming && pendingInterventionPresent;
@@ -317,8 +327,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
 
     const expandToggleIcon = expandLevel === 'semi' ? Maximize2 : Minimize2;
 
-    const handleToggleExpand = (e: React.MouseEvent | React.KeyboardEvent) => {
-      e.stopPropagation();
+    const handleToggleExpand = () => {
       if (expandLevel === 'semi') {
         setExpandLevel('full');
         userOpenedRef.current = true;
@@ -327,15 +336,29 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
       }
     };
 
-    const handleToggleKeyDown = (e: React.KeyboardEvent) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        handleToggleExpand(e);
-      }
-    };
+    const expandToggleNode = (
+      <AnimatePresence initial={false}>
+        {showExpandToggle && (
+          <motion.div
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            initial={{ opacity: 0, scale: 0.9 }}
+            style={{ display: 'flex' }}
+            transition={WORKFLOW_EXPAND_TOGGLE_TRANSITION}
+          >
+            <ActionIcon
+              icon={expandToggleIcon}
+              size={{ blockSize: 24, size: WORKFLOW_EXPAND_TOGGLE_ICON_SIZE }}
+              title={expandToggleLabel}
+              onClick={handleToggleExpand}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    );
 
     const title = (
-      <Flexbox horizontal align="center" gap={6} width="100%">
+      <Flexbox horizontal align="center" gap={6} style={{ minWidth: 0 }}>
         <Block
           horizontal
           align="center"
@@ -352,9 +375,12 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
           <Flexbox
             horizontal
             align="center"
-            flex={1}
             gap={6}
-            style={{ minHeight: WORKFLOW_STREAMING_TITLE_MIN_HEIGHT_PX, minWidth: 0 }}
+            style={{
+              minHeight: WORKFLOW_STREAMING_TITLE_MIN_HEIGHT_PX,
+              minWidth: 0,
+              overflow: 'hidden',
+            }}
           >
             <div style={{ minWidth: 0, overflow: 'hidden' }}>
               <AnimatePresence initial={false} mode="wait">
@@ -392,13 +418,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
             )}
           </Flexbox>
         ) : (
-          <Flexbox
-            horizontal
-            align="center"
-            flex={1}
-            gap={6}
-            style={{ minWidth: 0, overflow: 'hidden' }}
-          >
+          <Flexbox horizontal align="center" gap={6} style={{ minWidth: 0, overflow: 'hidden' }}>
             <Text
               type="secondary"
               style={{
@@ -417,46 +437,6 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
             )}
           </Flexbox>
         )}
-        <AnimatePresence initial={false}>
-          {showExpandToggle && (
-            <motion.div
-              animate={{ opacity: 1, scale: 1, x: 0 }}
-              aria-label={expandToggleLabel}
-              exit={{ opacity: 0, scale: 0.9, x: 4 }}
-              initial={{ opacity: 0, scale: 0.9, x: 4 }}
-              role="button"
-              tabIndex={0}
-              title={expandToggleLabel}
-              transition={WORKFLOW_EXPAND_TOGGLE_TRANSITION}
-              style={{
-                cursor: 'pointer',
-                flex: 'none',
-                marginInlineStart: 8,
-                outline: 'none',
-                padding: 2,
-              }}
-              onClick={handleToggleExpand}
-              onKeyDown={handleToggleKeyDown}
-            >
-              <AnimatePresence initial={false} mode="wait">
-                <motion.span
-                  animate={{ opacity: 1, rotate: 0, scale: 1 }}
-                  exit={{ opacity: 0, rotate: 60, scale: 0.85 }}
-                  initial={{ opacity: 0, rotate: -60, scale: 0.85 }}
-                  key={expandLevel}
-                  style={{ display: 'flex' }}
-                  transition={WORKFLOW_EXPAND_TOGGLE_TRANSITION}
-                >
-                  <Icon
-                    color={cssVar.colorTextSecondary}
-                    icon={expandToggleIcon}
-                    size={WORKFLOW_EXPAND_TOGGLE_ICON_SIZE}
-                  />
-                </motion.span>
-              </AnimatePresence>
-            </motion.div>
-          )}
-        </AnimatePresence>
       </Flexbox>
     );
 
@@ -466,7 +446,14 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
         variant="borderless"
         onExpandedChange={handleExpandedChange}
       >
-        <AccordionItem itemKey="workflow" paddingBlock={4} paddingInline={4} title={title}>
+        <AccordionItem
+          alwaysShowAction
+          action={expandToggleNode}
+          itemKey="workflow"
+          paddingBlock={4}
+          paddingInline={4}
+          title={title}
+        >
           <WorkflowExpandedList
             assistantId={assistantMessageId}
             blocks={blocks}

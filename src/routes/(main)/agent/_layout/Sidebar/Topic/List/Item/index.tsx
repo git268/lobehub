@@ -1,11 +1,13 @@
+import type { ChatTopicMetadata, ChatTopicStatus } from '@lobechat/types';
 import { Flexbox, Icon, Skeleton, Tag } from '@lobehub/ui';
 import { createStaticStyles, cssVar, keyframes, useTheme } from 'antd-style';
-import { HashIcon, MessageSquareDashed } from 'lucide-react';
+import { CheckCircle2, HashIcon, MessageSquareDashed } from 'lucide-react';
 import { memo, Suspense, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import DotsLoading from '@/components/DotsLoading';
 import RingLoadingIcon from '@/components/RingLoading';
+import { SESSION_CHAT_TOPIC_URL } from '@/const/url';
 import { isDesktop } from '@/const/version';
 import { pluginRegistry } from '@/features/Electron/titlebar/RecentlyViewed/plugins';
 import NavItem from '@/features/NavPanel/components/NavItem';
@@ -14,7 +16,6 @@ import { useAgentStore } from '@/store/agent';
 import { useChatStore } from '@/store/chat';
 import { operationSelectors } from '@/store/chat/selectors';
 import { useElectronStore } from '@/store/electron';
-import type { ChatTopicMetadata } from '@/types/topic';
 
 import { useTopicNavigation } from '../../hooks/useTopicNavigation';
 import ThreadList from '../../TopicListContent/ThreadList';
@@ -75,11 +76,12 @@ interface TopicItemProps {
   fav?: boolean;
   id?: string;
   metadata?: ChatTopicMetadata;
+  status?: ChatTopicStatus | null;
   threadId?: string;
   title: string;
 }
 
-const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, metadata }) => {
+const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, metadata, status }) => {
   const { t } = useTranslation('topic');
   const { isDarkMode } = useTheme();
   const activeAgentId = useAgentStore((s) => s.activeAgentId);
@@ -92,7 +94,7 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
   // Construct href for cmd+click support
   const href = useMemo(() => {
     if (!activeAgentId || !id) return undefined;
-    return `/agent/${activeAgentId}?topic=${id}`;
+    return SESSION_CHAT_TOPIC_URL(activeAgentId, id);
   }, [activeAgentId, id]);
 
   const [editing, isLoading] = useChatStore((s) => [
@@ -104,7 +106,17 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
     id ? operationSelectors.isTopicUnreadCompleted(id) : () => false,
   );
 
-  const { focusTopicPopup, navigateToTopic, isInAgentSubRoute } = useTopicNavigation();
+  const {
+    focusTopicPopup,
+    navigateToTopic,
+    isInAgentSubRoute,
+    isInTopicContextRoute,
+    routeTopicId,
+  } = useTopicNavigation();
+  const isRouteTopicActive = Boolean(id && routeTopicId === id && isInTopicContextRoute);
+  const isTopicActive = Boolean(
+    (active || isRouteTopicActive) && !threadId && (!isInAgentSubRoute || isRouteTopicActive),
+  );
 
   const toggleEditing = useCallback(
     (visible?: boolean) => {
@@ -137,7 +149,8 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
       void navigateToTopic(id, { skipPopupFocus: true });
       return;
     }
-    const reference = pluginRegistry.parseUrl(`/agent/${activeAgentId}`, `topic=${id}`);
+    const url = SESSION_CHAT_TOPIC_URL(activeAgentId, id);
+    const reference = pluginRegistry.parseUrl(url, '');
     if (reference) {
       addTab(reference);
       void navigateToTopic(id);
@@ -147,8 +160,11 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
   const { dropdownMenu } = useTopicItemDropdownMenu({
     fav,
     id,
+    status,
     title,
   });
+
+  const isCompleted = status === 'completed';
 
   const hasUnread = id && isUnreadCompleted;
   const unreadIcon = (
@@ -162,7 +178,7 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
   if (!id) {
     return (
       <NavItem
-        active={active && !isInAgentSubRoute}
+        active={Boolean(active && !isInAgentSubRoute && !isInTopicContextRoute)}
         icon={
           isLoading ? (
             <RingLoadingIcon
@@ -197,7 +213,7 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
     <Flexbox data-testid="topic-item" style={{ position: 'relative' }}>
       <NavItem
         actions={<Actions dropdownMenu={dropdownMenu} />}
-        active={active && !threadId && !isInAgentSubRoute}
+        active={isTopicActive}
         contextMenuItems={dropdownMenu}
         disabled={editing}
         href={href}
@@ -209,6 +225,15 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
                 ringColor={loadingRingColor}
                 size={14}
                 style={{ color: cssVar.colorWarning }}
+              />
+            );
+          }
+          if (isCompleted) {
+            return (
+              <Icon
+                icon={CheckCircle2}
+                size={'small'}
+                style={{ color: cssVar.colorTextDescription }}
               />
             );
           }
@@ -227,7 +252,7 @@ const TopicItem = memo<TopicItemProps>(({ id, title, fav, active, threadId, meta
         onDoubleClick={() => void handleDoubleClick()}
       />
       <Editing id={id} title={title} toggleEditing={toggleEditing} />
-      {active && (
+      {isTopicActive && (
         <Suspense
           fallback={
             <Flexbox gap={8} paddingBlock={8} paddingInline={24} width={'100%'}>

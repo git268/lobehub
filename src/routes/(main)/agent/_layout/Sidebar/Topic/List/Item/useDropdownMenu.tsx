@@ -1,7 +1,10 @@
+import type { ChatTopicStatus } from '@lobechat/types';
 import { type MenuProps } from '@lobehub/ui';
 import { Icon } from '@lobehub/ui';
 import { App } from 'antd';
 import {
+  CheckCircle2,
+  Circle,
   ExternalLink,
   Link2,
   LucideCopy,
@@ -17,6 +20,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 
 import { openRenameModal } from '@/components/RenameModal';
+import { SESSION_CHAT_TOPIC_URL } from '@/const/url';
 import { isDesktop } from '@/const/version';
 import { pluginRegistry } from '@/features/Electron/titlebar/RecentlyViewed/plugins';
 import { openShareModal } from '@/features/ShareModal';
@@ -29,10 +33,16 @@ import { useGlobalStore } from '@/store/global';
 interface TopicItemDropdownMenuProps {
   fav?: boolean;
   id?: string;
+  status?: ChatTopicStatus | null;
   title: string;
 }
 
-export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMenuProps) => {
+export const useTopicItemDropdownMenu = ({
+  fav,
+  id,
+  status,
+  title,
+}: TopicItemDropdownMenuProps) => {
   const { t } = useTranslation(['topic', 'common']);
   const { modal, message } = App.useApp();
   const navigate = useNavigate();
@@ -42,14 +52,25 @@ export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMe
   const addTab = useElectronStore((s) => s.addTab);
   const appOrigin = useAppOrigin();
 
-  const [autoRenameTopicTitle, duplicateTopic, removeTopic, favoriteTopic, updateTopicTitle] =
-    useChatStore((s) => [
-      s.autoRenameTopicTitle,
-      s.duplicateTopic,
-      s.removeTopic,
-      s.favoriteTopic,
-      s.updateTopicTitle,
-    ]);
+  const [
+    autoRenameTopicTitle,
+    duplicateTopic,
+    removeTopic,
+    favoriteTopic,
+    markTopicCompleted,
+    unmarkTopicCompleted,
+    updateTopicTitle,
+  ] = useChatStore((s) => [
+    s.autoRenameTopicTitle,
+    s.duplicateTopic,
+    s.removeTopic,
+    s.favoriteTopic,
+    s.markTopicCompleted,
+    s.unmarkTopicCompleted,
+    s.updateTopicTitle,
+  ]);
+
+  const isCompleted = status === 'completed';
   const handleOpenShareModal = useCallback(() => {
     if (!id) return;
 
@@ -60,6 +81,21 @@ export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMe
     if (!id) return [];
 
     return [
+      {
+        icon: <Icon icon={isCompleted ? Circle : CheckCircle2} />,
+        key: 'markCompleted',
+        label: isCompleted ? t('actions.unmarkCompleted') : t('actions.markCompleted'),
+        onClick: () => {
+          if (isCompleted) {
+            unmarkTopicCompleted(id);
+          } else {
+            markTopicCompleted(id);
+          }
+        },
+      },
+      {
+        type: 'divider' as const,
+      },
       {
         icon: <Icon icon={Star} />,
         key: 'favorite',
@@ -105,8 +141,8 @@ export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMe
               label: t('actions.openInNewTab'),
               onClick: () => {
                 if (!activeAgentId) return;
-                const url = `/agent/${activeAgentId}?topic=${id}`;
-                const reference = pluginRegistry.parseUrl(`/agent/${activeAgentId}`, `topic=${id}`);
+                const url = SESSION_CHAT_TOPIC_URL(activeAgentId, id);
+                const reference = pluginRegistry.parseUrl(url, '');
                 if (reference) {
                   addTab(reference);
                   navigate(url);
@@ -132,7 +168,7 @@ export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMe
         label: t('actions.copyLink'),
         onClick: () => {
           if (!activeAgentId) return;
-          const url = `${appOrigin}/agent/${activeAgentId}?topic=${id}`;
+          const url = `${appOrigin}${SESSION_CHAT_TOPIC_URL(activeAgentId, id)}`;
           navigator.clipboard.writeText(url);
           message.success(t('actions.copyLinkSuccess'));
         },
@@ -177,12 +213,15 @@ export const useTopicItemDropdownMenu = ({ fav, id, title }: TopicItemDropdownMe
   }, [
     id,
     fav,
+    isCompleted,
     title,
     activeAgentId,
     appOrigin,
     autoRenameTopicTitle,
     duplicateTopic,
     favoriteTopic,
+    markTopicCompleted,
+    unmarkTopicCompleted,
     removeTopic,
     updateTopicTitle,
     openTopicInNewWindow,

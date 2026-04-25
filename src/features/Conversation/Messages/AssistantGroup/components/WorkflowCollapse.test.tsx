@@ -17,11 +17,36 @@ vi.mock('@lobehub/ui', () => ({
       {children}
     </div>
   ),
-  AccordionItem: ({ children, title }: { children?: ReactNode; title?: ReactNode }) => (
+  AccordionItem: ({
+    action,
+    children,
+    title,
+  }: {
+    action?: ReactNode;
+    children?: ReactNode;
+    title?: ReactNode;
+  }) => (
     <div>
       <div>{title}</div>
+      <div>{action}</div>
       <div>{children}</div>
     </div>
+  ),
+  // Needs to resolve to a `button` with an accessible name that matches the
+  // `title` prop so the tests' `getByRole('button', { name: 'Expand fully' })`
+  // assertions can find the expand toggle.
+  ActionIcon: ({
+    icon: IconComponent,
+    onClick,
+    title,
+  }: {
+    icon?: ComponentType;
+    onClick?: (e: unknown) => void;
+    title?: string;
+  }) => (
+    <button aria-label={title} type="button" onClick={onClick}>
+      {IconComponent ? <IconComponent /> : null}
+    </button>
   ),
   Block: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   Flexbox: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
@@ -129,16 +154,54 @@ describe('WorkflowCollapse', () => {
     expect(getExpandedKeys()).toBe('["workflow"]');
   });
 
-  it('respects defaultStreamingExpanded={false} while streaming', () => {
+  it("respects defaultWorkflowExpandLevel='collapsed' while streaming", () => {
     render(
       <WorkflowCollapse
         assistantMessageId="msg-1"
         blocks={makeBlocks()}
-        defaultStreamingExpanded={false}
+        defaultWorkflowExpandLevel="collapsed"
       />,
     );
 
     expect(getExpandedKeys()).toBe('[]');
+  });
+
+  it("respects defaultWorkflowExpandLevel='full' after completion", () => {
+    mockIsGenerating = false;
+    render(
+      <WorkflowCollapse
+        assistantMessageId="msg-1"
+        blocks={makeBlocks({ result: { content: 'ok' } })}
+        defaultWorkflowExpandLevel="full"
+      />,
+    );
+
+    expect(getExpandedKeys()).toBe('["workflow"]');
+    expect(screen.getByRole('button', { name: 'Collapse' })).toBeInTheDocument();
+  });
+
+  it("keeps defaultWorkflowExpandLevel='full' across streaming→complete transition", () => {
+    const { rerender } = render(
+      <WorkflowCollapse
+        assistantMessageId="msg-1"
+        blocks={makeBlocks()}
+        defaultWorkflowExpandLevel="full"
+      />,
+    );
+
+    expect(getExpandedKeys()).toBe('["workflow"]');
+
+    mockIsGenerating = false;
+    rerender(
+      <WorkflowCollapse
+        assistantMessageId="msg-1"
+        blocks={makeBlocks({ result: { content: 'ok' } })}
+        defaultWorkflowExpandLevel="full"
+      />,
+    );
+
+    expect(getExpandedKeys()).toBe('["workflow"]');
+    expect(screen.getByRole('button', { name: 'Collapse' })).toBeInTheDocument();
   });
 
   it('auto expands and switches the header when confirmation is pending', async () => {
@@ -220,7 +283,7 @@ describe('WorkflowCollapse', () => {
       <WorkflowCollapse
         assistantMessageId="msg-1"
         blocks={makeBlocks()}
-        defaultStreamingExpanded={false}
+        defaultWorkflowExpandLevel="collapsed"
       />,
     );
 
