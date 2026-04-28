@@ -46,6 +46,8 @@ import { useUserMemoryStore } from '@/store/userMemory';
 
 import { dbMessageSelectors, displayMessageSelectors, topicSelectors } from '../../../selectors';
 import { messageMapKey } from '../../../utils/messageMapKey';
+import { topicMapKey } from '../../../utils/topicMapKey';
+import { AI_RUNTIME_OPERATION_TYPES } from '../../operation/types';
 import {
   type CommandSendOverrides,
   hasNonActionContent,
@@ -116,6 +118,30 @@ export class ConversationLifecycleActionImpl {
     void set;
     this.#get = get;
   }
+
+  /**
+   * Read the active topic-list filter from `topicDataMap` so it can be
+   * forwarded to `sendMessageInServer`. Without this, the server returns
+   * an unfiltered list which `internal_updateTopics` then writes back over
+   * the filtered sidebar — completed/cron topics reappear until the next
+   * SWR revalidation.
+   */
+  #getTopicFilter = (
+    agentId?: string,
+    groupId?: string,
+  ):
+    | { excludeStatuses?: string[]; excludeTriggers?: string[]; includeTriggers?: string[] }
+    | undefined => {
+    if (!agentId && !groupId) return undefined;
+    const data = this.#get().topicDataMap[topicMapKey({ agentId, groupId })];
+    if (!data) return undefined;
+    const { excludeStatuses, excludeTriggers } = data;
+    if (!excludeStatuses?.length && !excludeTriggers?.length) return undefined;
+    return {
+      ...(excludeStatuses?.length ? { excludeStatuses } : {}),
+      ...(excludeTriggers?.length ? { excludeTriggers } : {}),
+    };
+  };
 
   sendMessage = async ({
     message,
@@ -234,13 +260,16 @@ export class ConversationLifecycleActionImpl {
     if (!message && !hasFile) return;
 
     // ━━━ Message Queue: enqueue if agent is currently running ━━━
-    // Check if there's a running execAgentRuntime operation in the current context.
-    // If so, enqueue the message instead of starting a new operation.
+    // Check if there's a running agent-runtime operation in the current context.
+    // If so, enqueue the message instead of starting a new operation. Covers all
+    // three runtime paths (`AI_RUNTIME_OPERATION_TYPES`) — Client, heterogeneous
+    // agent / CC, and Gateway — so a follow-up send never spawns a parallel
+    // `claude` process or a second server-side run.
     const currentContextKey = messageMapKey(operationContext);
     const contextOpIds = this.#get().operationsByContext[currentContextKey] || [];
     const runningAgentOp = contextOpIds
       .map((id) => this.#get().operations[id])
-      .find((op) => op && op.type === 'execAgentRuntime' && op.status === 'running');
+      .find((op) => op && AI_RUNTIME_OPERATION_TYPES.includes(op.type) && op.status === 'running');
 
     if (runningAgentOp) {
       this.#get().enqueueMessage(
@@ -407,6 +436,10 @@ export class ConversationLifecycleActionImpl {
               parentId,
             },
             threadId: operationContext.threadId ?? undefined,
+            topicFilter: this.#getTopicFilter(
+              operationContext.agentId,
+              operationContext.groupId ?? undefined,
+            ),
             topicId: operationContext.topicId ?? undefined,
           },
           abortController,
@@ -598,6 +631,10 @@ export class ConversationLifecycleActionImpl {
           preloadMessages: undefined,
           // if there is topicId, then add topicId to message
           topicId: topicId ?? undefined,
+          topicFilter: this.#getTopicFilter(
+            operationContext.agentId,
+            operationContext.groupId ?? undefined,
+          ),
           threadId: operationContext.threadId ?? undefined,
           // Support creating new thread along with message
           newThread: newThread
