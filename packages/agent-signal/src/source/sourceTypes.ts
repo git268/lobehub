@@ -1,6 +1,6 @@
-import type { AgentSignalSource, BaseSource } from '@lobechat/agent-signal';
+import type { AgentSignalSource, BaseSource } from '../base/types';
 
-/** Server-owned AgentSignal source type identifiers. */
+/** AgentSignal source type identifiers shared by browser producers and server executors. */
 export const AGENT_SIGNAL_SOURCE_TYPES = {
   agentExecutionCompleted: 'agent.execution.completed',
   agentExecutionFailed: 'agent.execution.failed',
@@ -14,14 +14,16 @@ export const AGENT_SIGNAL_SOURCE_TYPES = {
   clientRuntimeStart: 'client.runtime.start',
   runtimeAfterStep: 'runtime.after_step',
   runtimeBeforeStep: 'runtime.before_step',
+  toolOutcomeCompleted: 'tool.outcome.completed',
+  toolOutcomeFailed: 'tool.outcome.failed',
 } as const;
 
 type ValueOf<TValue> = TValue[keyof TValue];
 
-/** Server-owned AgentSignal source type union. */
+/** AgentSignal source type union derived from {@link AGENT_SIGNAL_SOURCE_TYPES}. */
 export type AgentSignalSourceType = ValueOf<typeof AGENT_SIGNAL_SOURCE_TYPES>;
 
-/** Server-owned AgentSignal source payloads keyed by source type. */
+/** AgentSignal source payloads keyed by source type. */
 export interface AgentSignalSourcePayloadMap {
   [AGENT_SIGNAL_SOURCE_TYPES.agentExecutionCompleted]: {
     agentId?: string;
@@ -43,7 +45,7 @@ export interface AgentSignalSourcePayloadMap {
   [AGENT_SIGNAL_SOURCE_TYPES.agentUserMessage]: {
     agentId?: string;
     documentPayload?: Record<string, unknown>;
-    intents?: Array<'document' | 'memory' | 'persona' | 'prompt'>;
+    intents?: Array<'document' | 'memory' | 'persona' | 'prompt' | 'skill'>;
     memoryPayload?: Record<string, unknown>;
     message: string;
     messageId: string;
@@ -121,9 +123,44 @@ export interface AgentSignalSourcePayloadMap {
     topicId?: string;
     turnCount?: number;
   };
+  [AGENT_SIGNAL_SOURCE_TYPES.toolOutcomeCompleted]: {
+    agentId?: string;
+    domainKey?: string;
+    intentClass?: string;
+    messageId?: string;
+    operationId?: string;
+    outcome: {
+      action?: string;
+      status: 'skipped' | 'succeeded';
+      summary?: string;
+    };
+    relatedObjects?: Array<{ objectId: string; objectType: string; relation?: string }>;
+    taskId?: string;
+    tool: { apiName?: string; identifier: string };
+    toolCallId?: string;
+    topicId?: string;
+  };
+  [AGENT_SIGNAL_SOURCE_TYPES.toolOutcomeFailed]: {
+    agentId?: string;
+    domainKey?: string;
+    intentClass?: string;
+    messageId?: string;
+    operationId?: string;
+    outcome: {
+      action?: string;
+      errorReason?: string;
+      status: 'failed';
+      summary?: string;
+    };
+    relatedObjects?: Array<{ objectId: string; objectType: string; relation?: string }>;
+    taskId?: string;
+    tool: { apiName?: string; identifier: string };
+    toolCallId?: string;
+    topicId?: string;
+  };
 }
 
-/** Server-owned AgentSignal source variant. */
+/** AgentSignal source variant with source-type-specific payload typing. */
 export type AgentSignalSourceVariant<
   TSourceType extends AgentSignalSourceType = AgentSignalSourceType,
 > = BaseSource & {
@@ -131,50 +168,56 @@ export type AgentSignalSourceVariant<
   sourceType: TSourceType;
 };
 
-/** Server-owned AgentSignal source union. */
+/** Union of every known AgentSignal source variant. */
 export type AgentSignalSourceVariants = {
   [TSourceType in AgentSignalSourceType]: AgentSignalSourceVariant<TSourceType>;
 }[AgentSignalSourceType];
 
-/** Server-owned alias retained for user-message sources. */
+/** User-message source variant. */
 export type SourceAgentUserMessage = AgentSignalSourceVariant<'agent.user.message'>;
 
-/** Server-owned alias retained for execution-completed sources. */
+/** Agent execution-completed source variant. */
 export type SourceAgentExecutionCompleted = AgentSignalSourceVariant<'agent.execution.completed'>;
 
-/** Server-owned alias retained for execution-failed sources. */
+/** Agent execution-failed source variant. */
 export type SourceAgentExecutionFailed = AgentSignalSourceVariant<'agent.execution.failed'>;
 
-/** Server-owned alias retained for before-step runtime sources. */
+/** Runtime before-step source variant. */
 export type SourceRuntimeBeforeStep = AgentSignalSourceVariant<'runtime.before_step'>;
 
-/** Server-owned alias retained for after-step runtime sources. */
+/** Runtime after-step source variant. */
 export type SourceRuntimeAfterStep = AgentSignalSourceVariant<'runtime.after_step'>;
 
-/** Server-owned alias retained for merged bot-message sources. */
+/** Bot-message merged source variant. */
 export type SourceBotMessageMerged = AgentSignalSourceVariant<'bot.message.merged'>;
 
-/** Server-owned alias retained for client gateway stream-start sources. */
+/** Client gateway stream-start source variant. */
 export type SourceClientGatewayStreamStart =
   AgentSignalSourceVariant<'client.gateway.stream_start'>;
 
-/** Server-owned alias retained for client gateway step-complete sources. */
+/** Client gateway step-complete source variant. */
 export type SourceClientGatewayStepComplete =
   AgentSignalSourceVariant<'client.gateway.step_complete'>;
 
-/** Server-owned alias retained for client gateway runtime-end sources. */
+/** Client gateway runtime-end source variant. */
 export type SourceClientGatewayRuntimeEnd = AgentSignalSourceVariant<'client.gateway.runtime_end'>;
 
-/** Server-owned alias retained for client gateway error sources. */
+/** Client gateway error source variant. */
 export type SourceClientGatewayError = AgentSignalSourceVariant<'client.gateway.error'>;
 
-/** Server-owned alias retained for client runtime-start sources. */
+/** Client runtime-start source variant. */
 export type SourceClientRuntimeStart = AgentSignalSourceVariant<'client.runtime.start'>;
 
-/** Server-owned alias retained for client runtime-complete sources. */
+/** Client runtime-complete source variant. */
 export type SourceClientRuntimeComplete = AgentSignalSourceVariant<'client.runtime.complete'>;
 
-/** Client-originated source types accepted by the authenticated browser edge. */
+/** Tool outcome-completed source variant. */
+export type SourceToolOutcomeCompleted = AgentSignalSourceVariant<'tool.outcome.completed'>;
+
+/** Tool outcome-failed source variant. */
+export type SourceToolOutcomeFailed = AgentSignalSourceVariant<'tool.outcome.failed'>;
+
+/** Source types accepted by browser producers through the authenticated edge. */
 export const AGENT_SIGNAL_CLIENT_SOURCE_TYPES = [
   AGENT_SIGNAL_SOURCE_TYPES.clientGatewayError,
   AGENT_SIGNAL_SOURCE_TYPES.clientGatewayRuntimeEnd,
@@ -184,7 +227,19 @@ export const AGENT_SIGNAL_CLIENT_SOURCE_TYPES = [
   AGENT_SIGNAL_SOURCE_TYPES.clientRuntimeStart,
 ] as const satisfies readonly Extract<AgentSignalSourceType, `client.${string}`>[];
 
-/** Narrows one generic source node to the server-owned source catalog. */
+/**
+ * Narrows a generic source node to the shared AgentSignal source catalog.
+ *
+ * Use when:
+ * - Runtime middleware receives generic source nodes
+ * - Callers need source-type-specific payload typing after validation
+ *
+ * Expects:
+ * - `source.sourceType` is a string-like type identifier
+ *
+ * Returns:
+ * - Whether the source belongs to the built-in AgentSignal source catalog
+ */
 export const isAgentSignalKnownSource = (
   source: AgentSignalSource,
 ): source is AgentSignalSourceVariants => {
