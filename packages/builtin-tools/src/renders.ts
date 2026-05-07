@@ -26,6 +26,7 @@ import {
 } from '@lobechat/builtin-tool-local-system/client';
 import { MemoryManifest, MemoryRenders } from '@lobechat/builtin-tool-memory/client';
 import { MessageManifest, MessageRenders } from '@lobechat/builtin-tool-message/client';
+import { PageAgentManifest, PageAgentRenders } from '@lobechat/builtin-tool-page-agent/client';
 import { SkillStoreManifest, SkillStoreRenders } from '@lobechat/builtin-tool-skill-store/client';
 import { SkillsManifest, SkillsRenders } from '@lobechat/builtin-tool-skills/client';
 import { TaskManifest, TaskRenders } from '@lobechat/builtin-tool-task/client';
@@ -33,6 +34,10 @@ import {
   WebBrowsingManifest,
   WebBrowsingRenders,
 } from '@lobechat/builtin-tool-web-browsing/client';
+import {
+  WebOnboardingManifest,
+  WebOnboardingRenders,
+} from '@lobechat/builtin-tool-web-onboarding/client';
 import { RunCommandRender } from '@lobechat/shared-tool-ui/renders';
 import { type BuiltinRender } from '@lobechat/types';
 
@@ -64,11 +69,13 @@ const BuiltinToolsRenders: Record<string, Record<string, BuiltinRender>> = {
   [MemoryManifest.identifier]: MemoryRenders as Record<string, BuiltinRender>,
   [MessageManifest.identifier]: MessageRenders as Record<string, BuiltinRender>,
   [NotebookIdentifier]: NotebookRenders,
+  [PageAgentManifest.identifier]: PageAgentRenders as Record<string, BuiltinRender>,
   [SkillStoreManifest.identifier]: SkillStoreRenders as Record<string, BuiltinRender>,
   [SkillsManifest.identifier]: SkillsRenders as Record<string, BuiltinRender>,
   [TaskManifest.identifier]: TaskRenders as Record<string, BuiltinRender>,
   [LobeActivatorManifest.identifier]: LobeActivatorRenders as Record<string, BuiltinRender>,
   [WebBrowsingManifest.identifier]: WebBrowsingRenders as Record<string, BuiltinRender>,
+  [WebOnboardingManifest.identifier]: WebOnboardingRenders as Record<string, BuiltinRender>,
   codex: {
     ...CodexRenders,
     command_execution: RunCommandRender as BuiltinRender,
