@@ -1076,9 +1076,10 @@ export class AiAgentService {
     // Model metadata is needed both for tool support checks and agent-management context.
     const { loadModels } = await import('@/business/client/model-bank/loadModels');
     const builtinModels = await loadModels();
-    // Resolve S3 keys in imageList/videoList before visual tool activation checks and context build.
+    // Resolve file URLs before visual tool activation checks and context build.
     const fileService = new FileService(this.db, this.userId);
-    const postProcessUrl = (path: string | null) => fileService.getFullFileUrl(path);
+    const postProcessUrl = (path: string | null, file: { id?: string | null }) =>
+      fileService.getFileAccessUrl({ id: file.id, url: path });
     let historyMessagesCache: any[] | undefined;
     const loadHistoryMessages = async () => {
       if (historyMessagesCache) return historyMessagesCache;
@@ -1799,7 +1800,7 @@ export class AiAgentService {
           }
 
           fileIds.push(file.id);
-          const resolvedUrl = (await fileService.getFullFileUrl(file.url)) || file.url;
+          const resolvedUrl = (await fileService.getFileAccessUrl(file)) || file.url;
           const fileType = file.fileType || '';
 
           if (fileType.startsWith('image')) {
@@ -1987,23 +1988,25 @@ export class AiAgentService {
       },
     };
 
-    if (appContext?.scope !== 'page' && appContext?.documentId && topicId) {
+    if (appContext?.scope !== 'page' && appContext?.documentId) {
+      // Server is authoritative — `(agentId, documentId)` is a unique binding
+      // so a single indexed lookup both validates any caller-supplied
+      // `agentDocumentId` hint and resolves the row id when one was not
+      // provided (covers docs opened outside the active topic, e.g. skills
+      // and web docs).
       try {
-        const topicDocuments = await this.agentDocumentsService.listDocumentsForTopic(
+        const row = await this.agentDocumentsService.findRowByDocumentId(
           resolvedAgentId,
-          topicId,
-        );
-        const activeTopicDocument = topicDocuments.find(
-          (document) => document.documentId === appContext.documentId,
+          appContext.documentId,
         );
 
         initialContext = {
           ...initialContext,
           initialContext: {
             activeTopicDocument: {
-              agentDocumentId: activeTopicDocument?.id,
+              ...(row?.id ? { agentDocumentId: row.id } : {}),
               documentId: appContext.documentId,
-              title: activeTopicDocument?.title,
+              ...(row?.title ? { title: row.title } : {}),
             },
           },
         };

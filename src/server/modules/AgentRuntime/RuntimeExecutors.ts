@@ -13,9 +13,16 @@ import {
   UsageCounter,
 } from '@lobechat/agent-runtime';
 import { LobeActivatorIdentifier } from '@lobechat/builtin-tool-activator';
-import { CredsIdentifier, type CredSummary, generateCredsList } from '@lobechat/builtin-tool-creds';
+import {
+  CredsIdentifier,
+  type CredSummary,
+  generateCredsList,
+  generateKlavisServicesList,
+  type KlavisServiceSummary,
+} from '@lobechat/builtin-tool-creds';
 import { LocalSystemManifest } from '@lobechat/builtin-tool-local-system';
 import { BRANDING_PROVIDER } from '@lobechat/business-const';
+import { KLAVIS_SERVER_TYPES } from '@lobechat/const';
 import {
   type AgentContextDocument,
   type BotPlatformContext,
@@ -60,6 +67,7 @@ import {
 import { sanitizeToolCallArguments, serializePartsForStorage } from '@lobechat/utils';
 import debug from 'debug';
 
+import { klavisEnv } from '@/config/klavis';
 import { type MessageModel, MessageModel as MessageModelClass } from '@/database/models/message';
 import { TopicModel } from '@/database/models/topic';
 import { UserModel } from '@/database/models/user';
@@ -158,11 +166,11 @@ const archiveRuntimeToolResult = async (
   return archive.content === result.content ? result : { ...result, content: archive.content };
 };
 
-// Builds a postProcessUrl callback that resolves S3 keys in file-backed fields
-// (imageList, videoList, fileList) to absolute URLs. Must be passed to every
-// messageModel.query() call whose output is later fed to the LLM — otherwise
-// the provider layer receives raw keys like `files/user_xxx/icon.png` and
-// rejects them (see anthropic contextBuilder `Invalid image URL`).
+// Builds a postProcessUrl callback that resolves keys in file-backed fields
+// (imageList, videoList, fileList) to externally accessible URLs. Must be
+// passed to every messageModel.query() call whose output is later fed to the
+// LLM — otherwise the provider layer receives raw keys like
+// `files/user_xxx/icon.png` and rejects them.
 //
 // FileService is constructed lazily so environments without S3 config (unit
 // tests) don't fail at context-build time; failure returns undefined, which
@@ -175,7 +183,8 @@ const buildPostProcessUrl = (ctx: Pick<RuntimeExecutorContext, 'serverDB' | 'use
   } catch {
     return undefined;
   }
-  return (path: string | null) => fileService!.getFullFileUrl(path);
+  return (path: string | null, file: { id?: string | null }) =>
+    fileService!.getFileAccessUrl({ id: file.id, url: path });
 };
 
 const shouldRetryLLM = (kind: LLMErrorKind, attempt: number, maxRetries: number) =>
@@ -636,8 +645,10 @@ export const createRuntimeExecutors = (
         );
 
         // {{CREDS_LIST}} — used by lobe-creds system role.
-        // Mirrors client-side: lambdaClient.market.creds.list.query()
-        const isCredsEnabled = resolved.enabledToolIds.includes(CredsIdentifier);
+        // Gate on manifestMap presence, NOT enabledToolIds: in execAgent mode lobe-creds is
+        // added to manifestMap (for activator discovery) but never into enabledToolIds, so
+        // checking enabledToolIds would always be false while the system role IS injected.
+        const isCredsEnabled = !!resolved.manifestMap[CredsIdentifier];
         let credsListStr = '';
         if (isCredsEnabled && ctx.userId) {
           try {
@@ -661,6 +672,44 @@ export const createRuntimeExecutors = (
           }
         }
 
+        // {{KLAVIS_SERVICES_LIST}} — used by lobe-creds system role (Klavis integrations section).
+        // Mirrors client-side: klavisStoreSelectors.getServers() filtered by connection status.
+        let klavisServicesListStr = '';
+        if (isCredsEnabled && ctx.serverDB && ctx.userId && !!klavisEnv.KLAVIS_API_KEY) {
+          try {
+            const { PluginModel } = await import('@/database/models/plugin');
+            const pluginModel = new PluginModel(ctx.serverDB, ctx.userId);
+            const allPlugins = await pluginModel.query();
+            const validKlavisIds = new Set(KLAVIS_SERVER_TYPES.map((t) => t.identifier));
+            const connectedIds = new Set(
+              allPlugins
+                .filter(
+                  (p) =>
+                    validKlavisIds.has(p.identifier) &&
+                    (p.customParams as any)?.klavis?.isAuthenticated === true,
+                )
+                .map((p) => p.identifier),
+            );
+            const connected: KlavisServiceSummary[] = KLAVIS_SERVER_TYPES.filter((t) =>
+              connectedIds.has(t.identifier),
+            ).map((t) => ({ identifier: t.identifier, name: t.label }));
+            const available: KlavisServiceSummary[] = KLAVIS_SERVER_TYPES.filter(
+              (t) => !connectedIds.has(t.identifier),
+            ).map((t) => ({ identifier: t.identifier, name: t.label }));
+            klavisServicesListStr = generateKlavisServicesList(connected, available);
+            log(
+              'Fetched Klavis services for {{KLAVIS_SERVICES_LIST}}: connected=%d, available=%d',
+              connected.length,
+              available.length,
+            );
+          } catch (error) {
+            log(
+              'Failed to fetch Klavis services for {{KLAVIS_SERVICES_LIST}} substitution: %O',
+              error,
+            );
+          }
+        }
+
         const contextEngineInput = {
           agentDocuments,
           additionalVariables: {
@@ -672,6 +721,7 @@ export const createRuntimeExecutors = (
             // Creds tool variables
             sandbox_enabled: sandboxEnabled,
             ...(isCredsEnabled && { CREDS_LIST: credsListStr }),
+            ...(isCredsEnabled && { KLAVIS_SERVICES_LIST: klavisServicesListStr }),
             // Memory tool variables
             memory_effort: memoryEffort,
           },
@@ -1306,11 +1356,13 @@ export const createRuntimeExecutors = (
                 continue;
               }
 
-              // LOBE-9523: cancel/interrupt path — the model-runtime stream was aborted
-              // before reaching the post-stream finalize, so the DB row is still the
-              // LOADING_FLAT placeholder. Persist whatever partial content the stream
-              // callbacks already accumulated so reload/end snapshots do not clobber
-              // the client's in-memory streamed content.
+              // Cancel/interrupt path: when the user stops mid-stream, the model-runtime
+              // stream is aborted before reaching the post-stream finalize (line ~1078),
+              // so the DB row remains a LOADING_FLAT placeholder. Without this fix,
+              // agent_runtime_end would push the placeholder as the source-of-truth
+              // to the client, clobbering the streamed content accumulated in memory.
+              // We persist whatever partial content the stream callbacks already
+              // accumulated so that reload/end snapshots reflect actual progress.
               if (interrupted && (content || thinkingContent || toolsCalling.length > 0)) {
                 try {
                   const persistedTools =
@@ -1873,6 +1925,11 @@ export const createRuntimeExecutors = (
             chatToolPayload.source = toolSource;
           }
 
+          const timeoutMs = resolveToolTimeoutMs({
+            apiName: chatToolPayload.apiName,
+            args: parsedArgs,
+            manifest: effectiveManifestMap[chatToolPayload.identifier],
+          });
           // Execute tool using ToolExecutionService
           log(`[${operationLogId}] Executing tool ${toolName} ...`);
           execution = await executeToolWithRetry(
@@ -1881,6 +1938,7 @@ export const createRuntimeExecutors = (
                 activeDeviceId: state.metadata?.activeDeviceId,
                 agentId: state.metadata?.agentId,
                 documentId: state.metadata?.documentId,
+                executionTimeoutMs: timeoutMs,
                 groupId: state.metadata?.groupId,
                 memoryToolPermission: agentConfig?.chatConfig?.memory?.toolPermission,
                 messageId: state.metadata?.sourceMessageId,
@@ -2400,12 +2458,19 @@ export const createRuntimeExecutors = (
                 chatToolPayload.source = batchToolSource;
               }
 
+              const timeoutMs = resolveToolTimeoutMs({
+                apiName: chatToolPayload.apiName,
+                args: batchParsedArgs,
+                manifest: batchManifestMap[chatToolPayload.identifier],
+              });
+
               execution = await executeToolWithRetry(
                 () =>
                   toolExecutionService.executeTool(chatToolPayload, {
                     activeDeviceId: state.metadata?.activeDeviceId,
                     agentId: state.metadata?.agentId,
                     documentId: state.metadata?.documentId,
+                    executionTimeoutMs: timeoutMs,
                     groupId: state.metadata?.groupId,
                     memoryToolPermission: batchAgentConfig?.chatConfig?.memory?.toolPermission,
                     messageId: state.metadata?.sourceMessageId,
@@ -2661,7 +2726,7 @@ export const createRuntimeExecutors = (
     // Must pass agentId to ensure correct query scope, otherwise when topicId is undefined,
     // the query will use isNull(topicId) condition which won't find messages with actual topicId
     //
-    // postProcessUrl resolves S3 keys in imageList/videoList/fileList to absolute URLs;
+    // postProcessUrl resolves keys in imageList/videoList/fileList to external URLs;
     // without it the next LLM call sees raw keys and providers reject them.
     const latestMessages = await ctx.messageModel.query(
       {
