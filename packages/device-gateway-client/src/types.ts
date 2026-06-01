@@ -56,6 +56,7 @@ export interface ToolCallResponseMessage {
   result: {
     content: string;
     error?: string;
+    state?: unknown;
     success: boolean;
   };
   type: 'tool_call_response';
@@ -137,6 +138,13 @@ export interface AgentRunRequestMessage {
   operationId: string;
   prompt: string;
   resumeSessionId?: string;
+  /**
+   * Static context injected before the user prompt (workspace conventions,
+   * conversation history on resume). The desktop sends it to `lh hetero exec`
+   * as the first text block of a content-block array. Optional — omitted for
+   * older servers that don't build a device-specific context.
+   */
+  systemContext?: string;
   topicId: string;
   type: 'agent_run_request';
 }
