@@ -127,10 +127,9 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
    * Runtime environment configuration (desktop only)
    */
   runtimeEnv?: RuntimeEnvConfig;
-
   searchFCModel?: WorkingModel;
-  searchMode?: SearchMode;
 
+  searchMode?: SearchMode;
   /**
    * Skill activate mode:
    * - 'auto': Default tools (LobeTools, Skills, SkillStore, etc.) are always active,
@@ -147,11 +146,20 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
   textVerbosity?: 'low' | 'medium' | 'high';
 
   thinking?: 'disabled' | 'auto' | 'enabled';
+
   thinkingBudget?: number;
   thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high';
   thinkingLevel2?: 'low' | 'high';
   thinkingLevel3?: 'low' | 'medium' | 'high';
   thinkingLevel4?: 'minimal' | 'high';
+  /**
+   * Tool-resolution mode. When set it overrides the `enableAgentMode` derivation:
+   * - `agent`  full default toolset + plugins + always-on tools
+   * - `chat`   strict runtime-managed allow-list (KB / memory / web-browsing)
+   * - `custom` the toolset is EXACTLY the agent's declared plugins — nothing
+   *            auto-injected. For focused builtin sub-agents (e.g. the verifier).
+   */
+  toolMode?: 'agent' | 'chat' | 'custom';
   /**
    * Maximum length for tool execution result content (in characters)
    * This prevents context overflow when sending tool results back to LLM
@@ -206,6 +214,7 @@ export const AgentChatConfigSchema = z
     effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
     enableAdaptiveThinking: z.boolean().optional(),
     enableAgentMode: z.boolean().optional(),
+    toolMode: z.enum(['agent', 'chat', 'custom']).optional(),
     enableAutoScrollOnStreaming: z.boolean().optional(),
     enableCompressHistory: z.boolean().optional(),
     enableContextCompression: z.boolean().optional(),
@@ -250,7 +259,7 @@ export const AgentChatConfigSchema = z
     thinkingLevel3: z.enum(['low', 'medium', 'high']).optional(),
     thinkingLevel4: z.enum(['minimal', 'high']).optional(),
     toolResultMaxLength: z.number().default(25000),
-    topicGroupMode: z.enum(['byTime', 'byProject', 'flat']).optional(),
+    topicGroupMode: z.enum(['byTime', 'byProject', 'flat', 'byStatus']).optional(),
     urlContext: z.boolean().optional(),
     useModelBuiltinSearch: z.boolean().optional(),
   })
