@@ -270,6 +270,18 @@ export interface DeviceGitFileRevertResult {
   success: boolean;
 }
 
+/** Result of the `renameGitBranch` device RPC. Mirrors the desktop `GitRenameBranchResult`. */
+export interface DeviceGitRenameBranchResult {
+  error?: string;
+  success: boolean;
+}
+
+/** Result of the `deleteGitBranch` device RPC. Mirrors the desktop `GitDeleteBranchResult`. */
+export interface DeviceGitDeleteBranchResult {
+  error?: string;
+  success: boolean;
+}
+
 /**
  * Repo-relative paths of dirty working-tree files for a directory on a remote
  * device, returned by the `getGitWorkingTreeFiles` device RPC. Powers the Files
@@ -302,4 +314,65 @@ export interface DeviceProjectFileIndexResult {
   root: string;
   source: 'git' | 'glob';
   totalCount: number;
+}
+
+export interface DeviceLocalFilePreviewText {
+  content: string;
+  contentType: string;
+  type: 'text';
+}
+
+export interface DeviceLocalFilePreviewImage {
+  base64: string;
+  contentType: string;
+  type: 'image';
+}
+
+export interface DeviceLocalFilePreviewUnsupported {
+  contentType: string;
+  type: 'binary' | 'pdf' | 'video';
+}
+
+export type DeviceLocalFilePreview =
+  | DeviceLocalFilePreviewImage
+  | DeviceLocalFilePreviewText
+  | DeviceLocalFilePreviewUnsupported;
+
+/**
+ * File preview payload for a file on a remote device. Mirrors the desktop local
+ * file preview result but carries binary image content as base64 so it can cross
+ * the Gateway/RPC boundary.
+ */
+export interface DeviceLocalFilePreviewResult {
+  error?: string;
+  preview?: DeviceLocalFilePreview;
+  success: boolean;
+}
+
+/**
+ * A single project skill (`.agents/skills` / `.claude/skills`) discovered on a
+ * remote device, returned by the `listProjectSkills` device RPC. Mirrors the
+ * desktop `ProjectSkillItem` (`@lobechat/electron-client-ipc`).
+ */
+export interface DeviceProjectSkillItem {
+  description?: string;
+  fileCount: number;
+  files: string[];
+  name: string;
+  /** Absolute path to the SKILL.md file on the device. */
+  path: string;
+  /** Directory containing the SKILL.md. */
+  skillDir: string;
+  source: '.agents/skills' | '.claude/skills';
+}
+
+/**
+ * Project skills listing for a directory on a remote device, returned by the
+ * `listProjectSkills` device RPC. Powers the Resources tab's skills group in
+ * device mode. Mirrors the desktop `ListProjectSkillsResult`.
+ */
+export interface DeviceListProjectSkillsResult {
+  root: string;
+  skills: DeviceProjectSkillItem[];
+  source: DeviceProjectSkillItem['source'] | null;
 }

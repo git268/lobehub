@@ -36,6 +36,11 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
    * Disable context caching
    */
   disableContextCaching?: boolean;
+  /**
+   * Disable Gateway mode for this agent. Undefined means Gateway mode follows
+   * the app-level default and stays enabled when the server supports it.
+   */
+  disableGatewayMode?: boolean;
 
   effort?: 'low' | 'medium' | 'high' | 'max';
   /**
@@ -113,6 +118,12 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
    * Effort level for Claude Opus 4.7 and later (adds xhigh tier between high and max)
    */
   opus47Effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+  /**
+   * Whether to preserve and pass historical thinking content to the model
+   * (provider support required, e.g. Qwen preserve_thinking)
+   */
+  preserveThinking?: boolean;
   reasoningBudgetToken?: number;
   /**
    * Reasoning budget token for models with 32k max (GLM-5/GLM-4.7)
@@ -123,6 +134,7 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
    */
   reasoningBudgetToken80k?: number;
   reasoningEffort?: 'low' | 'medium' | 'high';
+  ring2_6ReasoningEffort?: 'high' | 'xhigh';
   /**
    * Runtime environment configuration (desktop only)
    */
@@ -180,10 +192,7 @@ export interface LobeAgentChatConfig extends AgentMemoryChatConfig, AgentSelfIte
 /**
  * Zod schema for RuntimeEnvConfig
  */
-const runtimeEnvModeEnum = z.enum(['local', 'cloud', 'none']);
-
 export const RuntimeEnvConfigSchema = z.object({
-  runtimeMode: z.record(z.string(), runtimeEnvModeEnum).optional(),
   workingDirectory: z.string().optional(),
 });
 
@@ -211,6 +220,7 @@ export const AgentChatConfigSchema = z
     deepseekV4ReasoningEffort: z.enum(['none', 'high', 'max']).optional(),
     compressionModelId: z.string().optional(),
     disableContextCaching: z.boolean().optional(),
+    disableGatewayMode: z.boolean().optional(),
     effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
     enableAdaptiveThinking: z.boolean().optional(),
     enableAgentMode: z.boolean().optional(),
@@ -231,6 +241,7 @@ export const AgentChatConfigSchema = z
     grok4_20ReasoningEffort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
     grok4_3ReasoningEffort: z.enum(['none', 'low', 'medium', 'high']).optional(),
     hy3ReasoningEffort: z.enum(['no_think', 'low', 'high']).optional(),
+    ring2_6ReasoningEffort: z.enum(['high', 'xhigh']).optional(),
     historyCount: z.number().optional(),
     imageAspectRatio: z.string().optional(),
     imageAspectRatio2: z.string().optional(),
@@ -238,6 +249,7 @@ export const AgentChatConfigSchema = z
     imageResolution2: z.enum(['512', '1K', '2K', '4K']).optional(),
     opus47Effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
     runtimeEnv: RuntimeEnvConfigSchema.optional(),
+    preserveThinking: z.boolean().optional(),
     reasoningBudgetToken: z.number().optional(),
     reasoningBudgetToken32k: z.number().optional(),
     reasoningBudgetToken80k: z.number().optional(),
