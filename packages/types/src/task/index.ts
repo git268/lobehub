@@ -139,7 +139,7 @@ export interface TaskSchedulerContext {
 
 // Pointer back to the agent conversation that spawned this task via the
 // `createTask` tool. Captured at creation so the task lifecycle can deliver the
-// handoff result back to that session once the task completes (LOBE-10625).
+// handoff result back to that session once the task completes.
 export interface TaskOriginContext {
   // The agent that invoked the createTask tool (the task's creator session).
   agentId?: string;
@@ -340,6 +340,12 @@ export interface TaskDetailActivity {
     threadId?: string | null;
   } | null;
   seq?: number | null;
+  /** Topic-only: task that owns this run when a parent detail includes descendant topics. */
+  sourceTaskId?: string | null;
+  /** Topic-only: display identifier of the task that owns this run, e.g. T-12. */
+  sourceTaskIdentifier?: string | null;
+  /** Topic-only: display name of the task that owns this run. */
+  sourceTaskName?: string | null;
   status?: string | null;
   summary?: string;
   taskId?: string | null;
