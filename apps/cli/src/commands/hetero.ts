@@ -19,6 +19,7 @@ import { TrpcIngestSink } from '../utils/TrpcIngestSink';
 
 const SUPPORTED_AGENT_TYPES = new Set(['claude-code', 'codex']);
 const CODEX_REASONING_EFFORT_CONFIG_KEY = 'model_reasoning_effort';
+const CODEX_SERVICE_TIER_CONFIG_KEY = 'service_tier';
 
 /**
  * Patterns that indicate a `--resume <sessionId>` run should be retried
@@ -80,6 +81,11 @@ interface ExecOptions {
   render?: 'jsonl' | 'none';
   resume?: string;
   /**
+   * Speed mode selection (Codex only). Translated into the native
+   * `service_tier` config; `fast` requests the Fast (priority) tier.
+   */
+  speed?: string;
+  /**
    * Server topic id.  When set, enables server-ingest mode: events are
    * batch-POSTed to `aiAgent.heteroIngest` in addition to (or instead of)
    * being written to stdout.  Requires `--operation-id` to be a valid
@@ -93,7 +99,7 @@ const collectImage = (value: string, previous: string[] = []): string[] => [...p
 const collectAgentArg = (value: string, previous: string[] = []): string[] => [...previous, value];
 
 const buildExtraArgs = (
-  options: Pick<ExecOptions, 'agentArg' | 'effort' | 'model' | 'type'>,
+  options: Pick<ExecOptions, 'agentArg' | 'effort' | 'model' | 'speed' | 'type'>,
 ): string[] | undefined => {
   const selectorArgs =
     options.type === 'codex'
@@ -102,6 +108,7 @@ const buildExtraArgs = (
           ...(options.effort
             ? ['-c', `${CODEX_REASONING_EFFORT_CONFIG_KEY}="${options.effort}"`]
             : []),
+          ...(options.speed ? ['-c', `${CODEX_SERVICE_TIER_CONFIG_KEY}="${options.speed}"`] : []),
         ]
       : [
           ...(options.model ? ['--model', options.model] : []),
@@ -524,7 +531,19 @@ const exec = async (options: ExecOptions): Promise<void> => {
       handle = await spawnAgent({ ...spawnOpts, onRawStdout: dumpAttempt?.writeStdout });
     } catch (err) {
       await dumpAttempt?.close();
-      log.error('Failed to start agent:', err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      log.error('Failed to start agent:', message);
+      if (serverIngester && sink) {
+        try {
+          await serverIngester.drain();
+          await sink.finish({
+            error: { message, type: 'AgentRuntimeError' },
+            result: 'error',
+          });
+        } catch {
+          // best-effort; process is exiting anyway
+        }
+      }
       process.exit(1);
     }
 
@@ -543,6 +562,13 @@ const exec = async (options: ExecOptions): Promise<void> => {
       dumpAttempt?.writeStderr(chunk);
     });
     handle.stderr.pipe(process.stderr);
+    const exit = handle.exit.catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      if (stderrContent.length < STDERR_CAP) {
+        stderrContent += `${stderrContent ? '\n' : ''}${message}`;
+      }
+      return { code: 1, signal: null as NodeJS.Signals | null };
+    });
 
     // Ctrl-C → SIGINT to the child's process group.
     // Repeated Ctrl-C escalates to SIGKILL.
@@ -633,7 +659,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
       process.off('SIGTERM', onSigterm);
     }
 
-    const { code, signal } = await handle.exit;
+    const { code, signal } = await exit;
     await stderrEnded;
     await dumpAttempt?.close();
 
@@ -786,6 +812,10 @@ export function registerHeteroCommand(program: Command) {
     .option('-d, --cwd <path>', 'Working directory for the spawned agent (default: process.cwd())')
     .option('--model <model>', 'Forward a resolved model selection to the agent CLI')
     .option('--effort <level>', 'Forward a resolved reasoning effort selection to the agent CLI')
+    .option(
+      '--speed <mode>',
+      'Forward a resolved speed selection to the agent CLI (codex only; `fast` requests the Fast service tier)',
+    )
     .option(
       '--agent-arg <arg>',
       'Forward one native agent CLI argument after wrapper parsing (repeatable)',
