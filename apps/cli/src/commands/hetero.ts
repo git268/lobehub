@@ -1,14 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
+import type { AskUserBridge } from '@lobechat/heterogeneous-agents/askUser';
+import { AskUserMcpServer } from '@lobechat/heterogeneous-agents/askUser';
+import { resolveHeteroSpawnCommand } from '@lobechat/heterogeneous-agents/resolveCliCommand';
 import type {
   AgentContentBlock,
   AgentImageSource,
   AgentPromptInput,
   AgentStreamEvent,
+  UploadHeterogeneousImage,
 } from '@lobechat/heterogeneous-agents/spawn';
 import { spawnAgent } from '@lobechat/heterogeneous-agents/spawn';
 import type { Command } from 'commander';
@@ -16,10 +21,19 @@ import type { Command } from 'commander';
 import { getTrpcClient } from '../api/client';
 import { log } from '../utils/logger';
 import { TrpcIngestSink } from '../utils/TrpcIngestSink';
+import { uploadFileBuffer } from '../utils/uploadLocalFile';
 
 const SUPPORTED_AGENT_TYPES = new Set(['claude-code', 'codex']);
 const CODEX_REASONING_EFFORT_CONFIG_KEY = 'model_reasoning_effort';
 const CODEX_SERVICE_TIER_CONFIG_KEY = 'service_tier';
+
+/** Extension seed for an uploaded tool_result image, by IANA media type. */
+const IMAGE_EXT_BY_MEDIA_TYPE: Record<string, string> = {
+  'image/gif': 'gif',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
 
 /**
  * Patterns that indicate a `--resume <sessionId>` run should be retried
@@ -472,6 +486,13 @@ const exec = async (options: ExecOptions): Promise<void> => {
   const agentType = options.type as 'claude-code' | 'codex';
   let sink: TrpcIngestSink | undefined;
   let serverIngester: SerialServerIngester | undefined;
+  // Uploader for tool_result images (CC `Read` on an image file). Reuses the
+  // CLI's authenticated lambda client so the persisted event carries a
+  // `{ fileId, url }` reference instead of heavy base64. Only wired in
+  // server-ingest mode — standalone runs don't persist events, so there is
+  // nothing to echo. The pipeline degrades a throw/undefined to the
+  // `[Image: …]` text placeholder, so this never fails the run.
+  let uploadImage: UploadHeterogeneousImage | undefined;
   if (serverIngest) {
     const client = await getTrpcClient();
     sink = new TrpcIngestSink(
@@ -482,6 +503,105 @@ const exec = async (options: ExecOptions): Promise<void> => {
       process.env.LOBEHUB_ASSISTANT_MESSAGE_ID,
     );
     serverIngester = new SerialServerIngester(sink);
+
+    uploadImage = async ({ data, mediaType }) => {
+      const ext = IMAGE_EXT_BY_MEDIA_TYPE[mediaType] ?? 'png';
+      const record = await uploadFileBuffer(await getTrpcClient(), {
+        buffer: Buffer.from(data, 'base64'),
+        fileName: `cc-read-image.${ext}`,
+        fileType: mediaType,
+      });
+      return { fileId: record.id, url: record.url };
+    };
+  }
+
+  // ─── AskUserQuestion MCP — remote Human-in-the-loop (claude-code only) ──────
+  //
+  // Mount the same `lobe_cc` MCP server the desktop app uses, but resolve the
+  // bridge over the server's Redis stream instead of Electron IPC:
+  //   - request out: `bridge.events()` ride the normal ingest sink → server
+  //     `heteroIngest` → Redis stream → renderer shows the AskUserQuestion card.
+  //   - response back: the sandbox can't read Redis, so a long-poll pulls the
+  //     `agent_intervention_response` off the stream (published by the browser's
+  //     `submitHeteroIntervention`) and resolves the pending bridge call.
+  // The bridge's own 5-min timeout is the backstop, so a dropped poll or an
+  // absent user never strands CC.
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  let askServer: AskUserMcpServer | undefined;
+  let askBridge: AskUserBridge | undefined;
+  let askMcpConfigPath: string | undefined;
+  const askPollAbort = new AbortController();
+  if (serverIngest && agentType === 'claude-code' && serverIngester) {
+    askServer = new AskUserMcpServer();
+    await askServer.start();
+    askBridge = askServer.registerOperation(operationId);
+    askMcpConfigPath = path.join(os.tmpdir(), `lobe-cc-mcp-${operationId}.json`);
+    await writeFile(
+      askMcpConfigPath,
+      JSON.stringify({
+        mcpServers: {
+          lobe_cc: {
+            alwaysLoad: true,
+            type: 'http',
+            url: askServer.urlForOperation(operationId),
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    // (i) Forward bridge events into the same ordered ingest path as CC's. The
+    // request always goes out. For responses, only forward the ones the browser
+    // can't have published itself — producer-side timeout / session_ended — so
+    // the renderer's card un-sticks; browser-originated answers (success /
+    // user_cancelled) are already on the stream via `submitHeteroIntervention`.
+    void (async () => {
+      for await (const event of askBridge!.events()) {
+        if (event.type === 'agent_intervention_response') {
+          const reason = (event.data as { cancelReason?: string })?.cancelReason;
+          if (reason !== 'timeout' && reason !== 'session_ended') continue;
+        }
+        serverIngester!.push(event as AgentStreamEvent);
+      }
+    })();
+
+    // (ii) Long-poll the server for the user's answer — only while a question is
+    // actually pending, so an idle run holds no server invocation.
+    void (async () => {
+      const client = await getTrpcClient();
+      let lastEventId = '$';
+      while (!askPollAbort.signal.aborted) {
+        if (askBridge!.pendingCount === 0) {
+          await sleep(200);
+          continue;
+        }
+        try {
+          const res = await client.aiAgent.waitInterventionResponse.query({
+            lastEventId,
+            operationId,
+          });
+          lastEventId = res.lastEventId;
+          for (const event of res.events) {
+            const data = event.data as {
+              cancelReason?: 'session_ended' | 'timeout' | 'user_cancelled';
+              cancelled?: boolean;
+              result?: unknown;
+              toolCallId: string;
+            };
+            // Idempotent: resolve() no-ops on an unknown / already-settled id.
+            askBridge!.resolve(data.toolCallId, {
+              cancelReason: data.cancelReason,
+              cancelled: data.cancelled,
+              result: data.result,
+            });
+          }
+        } catch {
+          // Transient (server hiccup / token refresh) — back off and retry.
+          // The bridge's 5-min timeout still bounds the overall wait.
+          await sleep(1000);
+        }
+      }
+    })();
   }
 
   /**
@@ -689,16 +809,30 @@ const exec = async (options: ExecOptions): Promise<void> => {
   // ─── First run (with --resume if provided) ───────────────────────────────
 
   const interceptResume = !!options.resume;
-  const extraArgs = buildExtraArgs(options);
+  const extraArgs = [
+    ...(buildExtraArgs(options) ?? []),
+    // Point CC at the lobe_cc AskUserQuestion MCP server we just mounted.
+    ...(askMcpConfigPath ? ['--mcp-config', askMcpConfigPath] : []),
+  ];
+  // Resolve the CLI binary once, up front, and reuse it for both the initial
+  // run and the resume-retry. For the default bare command (`codex`/`claude`)
+  // this finds the validated binary — including the Codex.app bundled CLI when
+  // a broken `codex` shim shadows PATH — so sandbox/terminal runs no longer
+  // ENOENT on a stale global install. Custom commands are used verbatim.
+  const resolvedCommand = await resolveHeteroSpawnCommand(agentType, options.command);
+  const commandEnv = resolvedCommand.pathEnv ? { PATH: resolvedCommand.pathEnv } : undefined;
+
   const first = await runOneAgent(
     {
       agentType: options.type,
-      command: options.command,
+      command: resolvedCommand.command,
       cwd: options.cwd || process.cwd(),
+      env: commandEnv,
       extraArgs,
       operationId,
       prompt: resolved.prompt,
       resumeSessionId: options.resume,
+      uploadImage,
     },
     interceptResume,
     'attempt-1',
@@ -723,11 +857,13 @@ const exec = async (options: ExecOptions): Promise<void> => {
     result = await runOneAgent(
       {
         agentType: options.type,
-        command: options.command,
+        command: resolvedCommand.command,
         cwd: options.cwd || process.cwd(),
+        env: commandEnv,
         extraArgs,
         operationId,
         prompt: resolved.prompt,
+        uploadImage,
         // No resumeSessionId — start fresh
       },
       false, // no need to intercept resume errors on a fresh run
@@ -779,6 +915,16 @@ const exec = async (options: ExecOptions): Promise<void> => {
       log.error('Failed to send heteroFinish:', err instanceof Error ? err.message : String(err));
     }
   }
+
+  // Tear down the AskUserQuestion MCP: stop polling, cancel any in-flight
+  // pending (→ CC's tool returns cleanly), close the server, drop the temp
+  // config. Best-effort — the process is about to exit anyway.
+  askPollAbort.abort();
+  if (askServer) {
+    askServer.unregisterOperation(operationId);
+    await askServer.stop().catch(() => {});
+  }
+  if (askMcpConfigPath) await unlink(askMcpConfigPath).catch(() => {});
 
   if (code !== null) process.exit(result.ingestError ? 1 : code);
   if (signal === 'SIGINT') process.exit(130);

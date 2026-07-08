@@ -111,6 +111,12 @@ export interface TaskTopicHandoff {
    * about the brief delivery itself, written by the lifecycle service.
    */
   briefDecision?: BriefDecision;
+  /**
+   * Raw last assistant message of the run, captured on completion.
+   * Shown on the run card alongside the LLM-synthesized `summary` so the feed
+   * surfaces the actual run output, not only the summary.
+   */
+  content?: string;
   keyFindings?: string[];
   nextAction?: string;
   summary?: string;
@@ -369,6 +375,8 @@ export interface TaskDetailData {
   checkpoint?: CheckpointConfig;
   config?: Record<string, unknown>;
   createdAt?: string;
+  /** Creator of the task; used by the UI to gate creator-only actions (e.g. make private). */
+  createdByUserId?: string | null;
   dependencies?: Array<{ dependsOn: string; type: string }>;
   description?: string | null;
   /** Rich-editor JSON state for the instruction; preserves details markdown drops (image size, etc.). */

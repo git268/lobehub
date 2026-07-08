@@ -253,11 +253,19 @@ describe('CodexAdapter', () => {
     ).toEqual([]);
   });
 
-  it('emits a new-step boundary when a second turn starts', () => {
+  it('delays a second turn boundary until the next visible item arrives', () => {
     const adapter = new CodexAdapter();
 
     const firstTurn = adapter.adapt({ type: 'turn.started' });
     const secondTurn = adapter.adapt({ type: 'turn.started' });
+    const nextMessage = adapter.adapt({
+      item: {
+        id: 'item_1',
+        text: 'Second turn output.',
+        type: 'agent_message',
+      },
+      type: 'item.completed',
+    });
 
     expect(firstTurn).toHaveLength(1);
     expect(firstTurn[0]).toMatchObject({
@@ -266,17 +274,47 @@ describe('CodexAdapter', () => {
       type: 'stream_start',
     });
 
-    expect(secondTurn).toHaveLength(2);
+    expect(secondTurn).toHaveLength(1);
     expect(secondTurn[0]).toMatchObject({
       data: {},
       stepIndex: 1,
       type: 'stream_end',
     });
-    expect(secondTurn[1]).toMatchObject({
+    expect(nextMessage).toHaveLength(2);
+    expect(nextMessage[0]).toMatchObject({
       data: { newStep: true, provider: 'codex' },
       stepIndex: 1,
       type: 'stream_start',
     });
+    expect(nextMessage[1]).toMatchObject({
+      data: { chunkType: 'text', content: 'Second turn output.' },
+      stepIndex: 1,
+      type: 'stream_chunk',
+    });
+  });
+
+  it('does not open a new visible step for an empty later turn', () => {
+    const adapter = new CodexAdapter();
+
+    adapter.adapt({ type: 'turn.started' });
+    const secondTurn = adapter.adapt({ type: 'turn.started' });
+    const completion = adapter.adapt({
+      type: 'turn.completed',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 3,
+      },
+    });
+
+    expect(secondTurn).toHaveLength(1);
+    expect(secondTurn[0]).toMatchObject({
+      stepIndex: 1,
+      type: 'stream_end',
+    });
+    expect(completion.map((event) => event.type)).toEqual([
+      'visible_output_end',
+      'agent_runtime_end',
+    ]);
   });
 
   it('emits a new-step boundary when a later agent_message item arrives in the same turn', () => {
@@ -425,6 +463,36 @@ describe('CodexAdapter', () => {
       stepIndex: 1,
       type: 'stream_chunk',
     });
+  });
+
+  it('aligns tool_end with the server shape — carries payload + result', () => {
+    const adapter = new CodexAdapter();
+    adapter.adapt({
+      item: {
+        command: 'git worktree add /wt',
+        id: 'item_1',
+        status: 'in_progress',
+        type: 'command_execution',
+      },
+      type: 'item.started',
+    });
+    const completed = adapter.adapt({
+      item: {
+        aggregated_output: 'Preparing worktree',
+        command: 'git worktree add /wt',
+        exit_code: 0,
+        id: 'item_1',
+        status: 'completed',
+        type: 'command_execution',
+      },
+      type: 'item.completed',
+    });
+
+    const end = completed.find((e) => e.type === 'tool_end');
+    expect(end!.data.payload).toMatchObject({
+      toolCalling: { apiName: 'command_execution', id: 'item_1', identifier: 'codex' },
+    });
+    expect(end!.data.result).toMatchObject({ success: true });
   });
 
   it('maps command execution items into tool lifecycle events', () => {
