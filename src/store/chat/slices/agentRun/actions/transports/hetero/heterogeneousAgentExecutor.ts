@@ -27,6 +27,7 @@ import type {
   ConversationContext,
   HeterogeneousProviderConfig,
   MessageMapScope,
+  ModelUsage,
   PageSelection,
   UIChatMessage,
   WorkingDirConfig,
@@ -56,10 +57,13 @@ import { topicSelectors } from '@/store/chat/selectors';
 import {
   mergeQueuedMessages,
   reconstructUploadFilesFromQueue,
+  type StreamRetryMetadata,
 } from '@/store/chat/slices/operation/types';
 import { type ChatStore, useChatStore } from '@/store/chat/store';
 import { notifyDesktopHumanApprovalRequired } from '@/store/chat/utils/desktopNotification';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
+import { useUserStore } from '@/store/user';
+import { labPreferSelectors } from '@/store/user/selectors';
 
 import { buildRunLifecycle } from '../../lifecycle/buildRunLifecycle';
 import type { RunScope } from '../../lifecycle/types';
@@ -67,6 +71,10 @@ import { createGatewayEventHandler, isCompletedRuntimeEnd } from '../gateway/gat
 
 /** Mirrors `idGenerator('threads', 16)` on the server so sync-allocated ids have the same shape. */
 const generateThreadId = () => `thd_${createNanoId(16)()}`;
+
+const markSkipMessageFetch = (event: AgentStreamEvent): void => {
+  event.data = { ...event.data, skipMessageFetch: true };
+};
 
 const CLI_AUTH_REQUIRED_PATTERNS = [
   /failed to authenticate/i,
@@ -159,12 +167,19 @@ const toHeterogeneousAgentMessageError = (error: unknown, agentType?: string): C
     };
   }
 
+  // A plain `{message}` object (adapter wire data / IPC error envelope)
+  // without the session-error marker keys above still carries the only
+  // human-readable reason — don't flatten it to the generic fallback.
+  const objectMessage =
+    typeof error === 'object' && error && 'message' in error && typeof error.message === 'string'
+      ? error.message
+      : undefined;
   const message =
     error instanceof Error
       ? error.message
       : typeof error === 'string'
         ? error
-        : 'Agent execution failed';
+        : (objectMessage ?? 'Agent execution failed');
 
   // Surface the underlying `cause` (e.g. undici's `ENOTFOUND` / `ECONNREFUSED`
   // hidden under a generic `TypeError: fetch failed`). The desktop IPC layer
@@ -284,6 +299,32 @@ const resolveAdapterType = (config: HeterogeneousProviderConfig): string => {
   return 'claude-code'; // default
 };
 
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+
+const pickString = (...values: unknown[]): string | undefined =>
+  values.find((value): value is string => typeof value === 'string' && value.length > 0);
+
+const pickFiniteNumber = (...values: unknown[]): number | undefined =>
+  values.find((value): value is number => typeof value === 'number' && Number.isFinite(value));
+
+const toStreamRetryMetadata = (
+  event: AgentStreamEvent,
+  fallbackAgentType: string,
+): StreamRetryMetadata => {
+  const data = asRecord(event.data);
+
+  return {
+    agentType: pickString(data.agentType, fallbackAgentType),
+    attempt: pickFiniteNumber(data.attempt),
+    delayMs: pickFiniteNumber(data.delayMs),
+    error: pickString(data.error, data.errorType, data.kind, data.message),
+    errorStatus: pickFiniteNumber(data.errorStatus, data.status, data.statusCode, data.httpStatus),
+    maxAttempts: pickFiniteNumber(data.maxAttempts),
+    provider: pickString(data.provider),
+  };
+};
+
 /**
  * Subscribe to Electron IPC broadcasts. As of phase 0, the main
  * process runs JSONL framing + adapter conversion + `toStreamEvent` itself
@@ -394,6 +435,7 @@ const persistToolResult = async (
 const HETERO_MESSAGE_WRITE_BATCH_IDLE_MS = 5_000;
 const HETERO_MESSAGE_WRITE_BATCH_MAX_OPS = 50;
 const HETERO_TERMINAL_PERSIST_DRAIN_TIMEOUT_MS = 10_000;
+const HETERO_TERMINAL_EVENT_GRACE_TIMEOUT_MS = 3_000;
 
 type MessageUpdateOperation = Extract<MessageBatchOperation, { type: 'updateMessage' }>;
 type ToolMessageUpdateOperation = Extract<MessageBatchOperation, { type: 'updateToolMessage' }>;
@@ -742,6 +784,9 @@ export const executeHeterogeneousAgent = async (
    * `persistToolResult` and the intervention handlers.
    */
   const toolMsgIdByCallId: Map<string, string> = new Map();
+  const mainToolCallIds = new Set<string>();
+  const pendingInterventionRequests = new Map<string, AgentInterventionRequestData>();
+  const pendingInterventionResponses = new Map<string, AgentInterventionResponseData>();
   /**
    * Shared main-agent run coordinator state — the pure reducer in
    * `@lobechat/heterogeneous-agents`. Owns the main turn/step state machine
@@ -779,10 +824,28 @@ export const executeHeterogeneousAgent = async (
    * be lost once the reducer clears `accContent` on terminal.
    */
   const pendingMainFlush = new Map<string, Record<string, any>>();
-  const pendingMainCreates = new Map<
+  /**
+   * Retry ledger for every failed row create — assistants AND tool rows, in one
+   * Map on purpose. `messages.parent_id` is a real FK and the parent graph is
+   * not layered: a tool row hangs off its assistant, but a signal/reactive
+   * assistant hangs off the run's last TOOL row (see `computeTurnParentId`).
+   * Splitting the ledger by role would replay a tool-parented assistant before
+   * its parent tool row and lose the turn. Enqueue order IS dependency order —
+   * the reducer can only name a parent it has already emitted a create for —
+   * and `Map` preserves insertion order, so one in-order drain is correct with
+   * no knowledge of which parent kind any given row uses.
+   */
+  const pendingCreates = new Map<
     string,
     Extract<MessageBatchOperation, { type: 'createMessage' }>['message']
   >();
+  /** Retry ledger for tool result content / plugin state. */
+  const pendingToolFlush = new Map<string, ToolMessageUpdateOperation['value']>();
+
+  /** Later intents carry a superset of the payload, so a shallow merge wins. */
+  const stashMainFlush = (messageId: string, update: Record<string, any>) => {
+    pendingMainFlush.set(messageId, { ...pendingMainFlush.get(messageId), ...update });
+  };
   /** Serializes async persist operations so ordering is stable. */
   let persistQueue: Promise<void> = Promise.resolve();
   /**
@@ -792,6 +855,41 @@ export const executeHeterogeneousAgent = async (
    * writes with stale DB state. onComplete forwards after persistence.
    */
   let deferredTerminalEvent: AgentStreamEvent | null = null;
+  let terminalEventWaiters: Array<() => void> = [];
+  const notifyTerminalEvent = () => {
+    const waiters = terminalEventWaiters;
+    terminalEventWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+  const waitForTerminalEvent = (ms: number): Promise<void> => {
+    if (deferredTerminalEvent) return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        terminalEventWaiters = terminalEventWaiters.filter((waiter) => waiter !== finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      terminalEventWaiters.push(finish);
+    });
+  };
+  let completionCallbackPromise: Promise<void> | null = null;
+  const runCompletionCallback = (callback: () => Promise<void>): Promise<void> => {
+    if (completionCallbackPromise) return completionCallbackPromise;
+
+    completionCallbackPromise = callback().catch((err) => {
+      console.error('[HeterogeneousAgent] completion callback failed:', err);
+    });
+    return completionCallbackPromise;
+  };
+  const waitForCompletionCallback = async () => {
+    const promise = completionCallbackPromise;
+    if (promise) await promise;
+  };
   /**
    * True while a step transition is in flight (stream_start queued but not yet
    * forwarded to handler). Events that would normally be forwarded sync must
@@ -810,6 +908,38 @@ export const executeHeterogeneousAgent = async (
    * was queued could start a second run and duplicate/interleave messages.
    */
   let sawStreamedEvent = false;
+
+  const getCurrentFrontendMessages = () =>
+    (get().dbMessagesMap?.[messageMapKey(context)] ??
+      get().messagesMap?.[messageMapKey(context)] ??
+      []) as UIChatMessage[];
+
+  const attachInitialAssistantSeed = (event: AgentStreamEvent): void => {
+    if (event.type !== 'stream_start') return;
+    if ((event.data as { newStep?: boolean } | undefined)?.newStep) return;
+    const data = (event.data ?? {}) as Record<string, any>;
+    if (data.assistantMessage?.id) return;
+
+    data.assistantMessage = {
+      agentId: context.agentId,
+      id: mainState.currentAssistantId,
+      model: data.model,
+      provider: data.provider,
+      role: 'assistant',
+      topicId: context.topicId ?? undefined,
+    };
+    event.data = data;
+  };
+
+  const attachTerminalFrontendSnapshot = (event: AgentStreamEvent): void => {
+    if (event.type !== 'agent_runtime_end') return;
+    const data = (event.data ?? {}) as Record<string, any>;
+    if (Array.isArray(data.uiMessages)) return;
+
+    const uiMessages = getCurrentFrontendMessages();
+    if (uiMessages.length === 0) return;
+    event.data = { ...data, uiMessages };
+  };
 
   // Subscribe to the operation's abort signal so we can drop late events and
   // stop writing to DB the moment the user clicks Stop. If the op is gone
@@ -921,22 +1051,97 @@ export const executeHeterogeneousAgent = async (
     isError: boolean,
     pluginState?: Record<string, any>,
   ) => {
+    if (!mainToolCallIds.has(toolCallId)) return;
+
     const toolMsgId = toolMsgIdByCallId.get(toolCallId);
     if (!toolMsgId) {
       console.warn('[HeterogeneousAgent] tool_result for unknown toolCallId:', toolCallId);
       return;
     }
 
-    messageWriteBatcher.enqueueToolMessageUpdate(
-      toolMsgId,
-      {
-        content,
-        pluginError: isError ? { message: content } : undefined,
-        pluginState,
-      },
-      messageWriteCtx,
-      (err) => console.error('[HeterogeneousAgent] Failed to update tool message content:', err),
-    );
+    const toolUpdate = {
+      content,
+      pluginError: isError ? { message: content } : undefined,
+      pluginState,
+    };
+    messageWriteBatcher.enqueueToolMessageUpdate(toolMsgId, toolUpdate, messageWriteCtx, (err) => {
+      console.error('[HeterogeneousAgent] Failed to update tool message content:', err);
+      pendingToolFlush.set(toolMsgId, { ...pendingToolFlush.get(toolMsgId), ...toolUpdate });
+    });
+  };
+  const applyInterventionRequest = async (data: AgentInterventionRequestData): Promise<boolean> => {
+    const toolMsgId = toolMsgIdByCallId.get(data.toolCallId);
+    if (!toolMsgId) return false;
+
+    // The id is pre-allocated before the batched createMessage has necessarily
+    // flushed. Persist the row before writing plugin/intervention state.
+    await messageWriteBatcher.flush('before-intervention-request');
+
+    try {
+      await get().optimisticUpdateMessagePlugin(
+        toolMsgId,
+        { intervention: { status: 'pending' } },
+        { operationId },
+      );
+      // Sidebar topic row swaps the running spinner for a hand icon
+      // so it's obvious from the topic list that this conversation is
+      // blocked on the user, not still streaming.
+      writeTopicStatus('waitingForHuman');
+      // Parity with the homogeneous approval paths (client / gateway /
+      // aiAgent): a CC AskUserQuestion now also bumps the dock badge and
+      // bounces the macOS dock. The helper is desktop-guarded and only
+      // requests attention while the window is hidden/unfocused, so it's
+      // a no-op when the user is already looking at the approval.
+      void notifyDesktopHumanApprovalRequired(get, context);
+    } catch (err) {
+      console.error('[HeterogeneousAgent] persist intervention pending failed:', err);
+    }
+
+    return true;
+  };
+  const applyInterventionResponse = async (
+    data: AgentInterventionResponseData,
+  ): Promise<boolean> => {
+    const { cancelled, cancelReason, toolCallId } = data;
+    if (!cancelled) return true;
+    if (cancelReason === 'user_cancelled') return true;
+
+    const toolMsgId = toolMsgIdByCallId.get(toolCallId);
+    if (!toolMsgId) return false;
+
+    await messageWriteBatcher.flush('before-intervention-response');
+
+    try {
+      await get().optimisticUpdateMessagePlugin(
+        toolMsgId,
+        {
+          intervention: {
+            rejectedReason: cancelReason ?? 'session_ended',
+            status: 'rejected',
+          },
+        },
+        { operationId },
+      );
+      // Bridge resolved without the user — drop the hand state so the
+      // sidebar reflects that we're back to whatever the stream does
+      // next (`active`/`failed` lands shortly after via runtime_end).
+      writeTopicStatus('running');
+    } catch (err) {
+      console.error('[HeterogeneousAgent] persist intervention rejection failed:', err);
+    }
+
+    return true;
+  };
+  const replayPendingInterventionsForToolCall = async (toolCallId: string): Promise<void> => {
+    const request = pendingInterventionRequests.get(toolCallId);
+    if (request && (await applyInterventionRequest(request))) {
+      pendingInterventionRequests.delete(toolCallId);
+    }
+
+    const response = pendingInterventionResponses.get(toolCallId);
+    if (response && (await applyInterventionResponse(response))) {
+      pendingInterventionResponses.delete(toolCallId);
+    }
   };
   const retryWithoutResume = (error: unknown): boolean => {
     if (
@@ -1190,6 +1395,7 @@ export const executeHeterogeneousAgent = async (
           }
           toolMsgIdByCallId.set(x.payload.id, x.toolMessageId);
           t?.stream.create(toolMsg as UIChatMessage);
+          await replayPendingInterventionsForToolCall(x.payload.id);
         }
 
         // Phase 3: backfill result_msg_id on assistant.tools[].
@@ -1268,13 +1474,13 @@ export const executeHeterogeneousAgent = async (
   // ─── Main-agent run coordinator (shared reducer) interpreter ─────────────
 
   /**
-   * Apply ONE main-scoped coordinator intent against the renderer's DB
-   * surfaces. Best-effort (errors logged, never thrown) — mirroring the prior
-   * inline persist helpers, so the run state always advances regardless of a
-   * transient DB failure (the next event / terminal flush re-persists). Live
-   * UI is NOT driven here: the executor still forwards raw stream events to the
-   * gateway `eventHandler` for token-level streaming, so `streamContent` is a
-   * no-op (the server no-ops it too).
+   * Apply ONE main-scoped coordinator intent against the renderer's write-behind
+   * DB queue plus the local raw-message bucket. Best-effort (errors logged,
+   * never thrown) — mirroring the prior inline persist helpers, so the run state
+   * always advances regardless of a transient DB failure (the next event /
+   * terminal flush re-persists). Token-level text/reasoning still streams via the
+   * gateway handler; tool rows and result links are local SoT here so tool_end
+   * reconciliation does not need a DB fetch.
    */
   const applyMainIntent = async (intent: MainAgentIntent) => {
     switch (intent.kind) {
@@ -1294,8 +1500,12 @@ export const executeHeterogeneousAgent = async (
         } as any;
         messageWriteBatcher.enqueueCreateMessage(messageToCreate, (err) => {
           console.error('[HeterogeneousAgent] Failed to create step assistant:', err);
-          pendingMainCreates.set(intent.messageId, messageToCreate);
+          pendingCreates.set(intent.messageId, messageToCreate);
         });
+        get().internal_dispatchMessage(
+          { id: intent.messageId, type: 'createMessage', value: messageToCreate },
+          { operationId },
+        );
         // Associate so cancellation / cleanup tracks the new step's message.
         get().associateMessageWithOperation(intent.messageId, operationId);
         return;
@@ -1316,12 +1526,25 @@ export const executeHeterogeneousAgent = async (
           messageWriteCtx,
           (err) => {
             console.error('[HeterogeneousAgent] Failed to flush main assistant:', err);
-            pendingMainFlush.set(intent.messageId, {
-              ...pendingMainFlush.get(intent.messageId),
-              ...update,
-            });
+            stashMainFlush(intent.messageId, update);
           },
         );
+        // Mirror ONLY model/provider into the store: content/reasoning already
+        // stream live via the gateway handler's raw stream_chunk forward. The
+        // CLI's model has no live path at all — the run's FIRST assistant is
+        // already in `dbMessagesMap` when the run starts, so the gateway's
+        // stream_start seed insert (its one model→store hop) is skipped for it
+        // and the flush above is DB-only. `provider` is already seeded from the
+        // agent config; re-stamping it keeps the store and the row identical.
+        const liveUpdate: Record<string, any> = {};
+        if (intent.model) liveUpdate.model = intent.model;
+        if (intent.provider) liveUpdate.provider = intent.provider;
+        if (Object.keys(liveUpdate).length > 0) {
+          get().internal_dispatchMessage(
+            { id: intent.messageId, type: 'updateMessage', value: liveUpdate },
+            { operationId },
+          );
+        }
         return;
       }
 
@@ -1350,21 +1573,9 @@ export const executeHeterogeneousAgent = async (
           return update;
         };
 
-        // Phase 1: pre-register assistant.tools[] (no result_msg_id yet) so the
-        // conversation-flow parser finds matching ids the moment tool rows land.
-        messageWriteBatcher.enqueueUpdateMessage(
-          intent.assistantMessageId,
-          buildUpdate(false),
-          messageWriteCtx,
-          (err) => console.error('[HeterogeneousAgent] Failed to pre-register main tools:', err),
-        );
-
-        // Phase 2: create rows for new tools with their pre-allocated ids and
-        // register the global lookup so a later tool_result resolves.
-        for (const x of intent.tools) {
-          if (!x.isNew) continue;
+        const buildToolMessage = (x: (typeof intent.tools)[number]) => {
           const toolMetadata = heteroProvenance(mainState.currentMainMessageId);
-          messageWriteBatcher.enqueueCreateMessage({
+          return {
             agentId: context.agentId,
             content: '',
             id: x.toolMessageId,
@@ -1379,17 +1590,64 @@ export const executeHeterogeneousAgent = async (
             role: 'tool',
             tool_call_id: x.payload.id,
             topicId: context.topicId ?? undefined,
-          } as any);
+          } as any;
+        };
+
+        // The ledger always carries the phase-3 shape: by the time it replays,
+        // the tool rows exist, and stashing the phase-1 shape would let a stale
+        // `tools[]` (no `result_msg_id`) clobber a phase-3 write that landed.
+        const finalAssistantUpdate = buildUpdate(true);
+
+        // Phase 1: pre-register assistant.tools[] (no result_msg_id yet) so the
+        // conversation-flow parser finds matching ids the moment tool rows land.
+        messageWriteBatcher.enqueueUpdateMessage(
+          intent.assistantMessageId,
+          buildUpdate(false),
+          messageWriteCtx,
+          (err) => {
+            console.error('[HeterogeneousAgent] Failed to pre-register main tools:', err);
+            stashMainFlush(intent.assistantMessageId, finalAssistantUpdate);
+          },
+        );
+
+        // Phase 2: create rows for new tools with their pre-allocated ids and
+        // register the global lookup so a later tool_result resolves.
+        for (const x of intent.tools) {
+          if (!x.isNew) continue;
+          const toolMsg = buildToolMessage(x);
+          messageWriteBatcher.enqueueCreateMessage(toolMsg, (err) => {
+            console.error('[HeterogeneousAgent] Failed to create tool message:', err);
+            pendingCreates.set(x.toolMessageId, toolMsg);
+          });
           toolMsgIdByCallId.set(x.payload.id, x.toolMessageId);
+          mainToolCallIds.add(x.payload.id);
+          get().internal_dispatchMessage(
+            { id: x.toolMessageId, type: 'createMessage', value: toolMsg },
+            { operationId },
+          );
         }
 
         // Phase 3: backfill result_msg_id on assistant.tools[].
         messageWriteBatcher.enqueueUpdateMessage(
           intent.assistantMessageId,
-          buildUpdate(true),
+          finalAssistantUpdate,
           messageWriteCtx,
-          (err) => console.error('[HeterogeneousAgent] Failed to finalize main tools:', err),
+          (err) => {
+            console.error('[HeterogeneousAgent] Failed to finalize main tools:', err);
+            stashMainFlush(intent.assistantMessageId, finalAssistantUpdate);
+          },
         );
+        get().internal_dispatchMessage(
+          {
+            id: intent.assistantMessageId,
+            type: 'updateMessage',
+            value: finalAssistantUpdate as Partial<UIChatMessage>,
+          },
+          { operationId },
+        );
+        for (const x of intent.tools) {
+          if (x.isNew) await replayPendingInterventionsForToolCall(x.payload.id);
+        }
         return;
       }
 
@@ -1400,22 +1658,46 @@ export const executeHeterogeneousAgent = async (
           intent.isError,
           intent.pluginState,
         );
+        const toolMsgId = toolMsgIdByCallId.get(intent.toolCallId);
+        if (toolMsgId && mainToolCallIds.has(intent.toolCallId)) {
+          const update: Partial<UIChatMessage> = { content: intent.content };
+          if (intent.pluginState) (update as any).pluginState = intent.pluginState;
+          if (intent.isError) (update as any).pluginError = { message: intent.content };
+          get().internal_dispatchMessage(
+            { id: toolMsgId, type: 'updateMessage', value: update },
+            { operationId },
+          );
+        }
         return;
       }
 
       case 'recordUsage': {
         const update = {
+          // Keep usage on the promoted top-level field so the live message UI
+          // can render it immediately, before the terminal DB refresh runs.
+          usage: intent.usage as ModelUsage,
           // Wholesale metadata overwrite — re-stamp the provenance the
-          // createAssistant write put there, or usage would wipe it.
-          metadata: {
-            ...heteroProvenance(mainState.currentMainMessageId),
-            usage: intent.usage as any,
-          },
+          // createAssistant write put there.
+          metadata: heteroProvenance(mainState.currentMainMessageId),
           ...(intent.model && { model: intent.model }),
           ...(intent.provider && { provider: intent.provider }),
         };
-        messageWriteBatcher.enqueueUpdateMessage(intent.messageId, update, messageWriteCtx, (err) =>
-          console.error('[HeterogeneousAgent] Failed to record main usage:', err),
+        messageWriteBatcher.enqueueUpdateMessage(
+          intent.messageId,
+          update,
+          messageWriteCtx,
+          (err) => {
+            console.error('[HeterogeneousAgent] Failed to record main usage:', err);
+            stashMainFlush(intent.messageId, update);
+          },
+        );
+        // Same payload into the store so usage + model/provider render live —
+        // the subagent interpreter's `recordUsage` already does this via
+        // `stream.update`. Dispatching `update` verbatim keeps the store's
+        // metadata identical to the row the batcher writes.
+        get().internal_dispatchMessage(
+          { id: intent.messageId, type: 'updateMessage', value: update as any },
+          { operationId },
         );
         return;
       }
@@ -1482,6 +1764,7 @@ export const executeHeterogeneousAgent = async (
       cwd: workingDirectory,
       env: heterogeneousProvider.env,
       resumeSessionId,
+      useClaudeCodeSdk: labPreferSelectors.enableClaudeCodeSdk(useUserStore.getState()),
     });
     agentSessionId = result.sessionId;
     if (!agentSessionId) throw new Error('Agent session returned no sessionId');
@@ -1516,6 +1799,17 @@ export const executeHeterogeneousAgent = async (
       // Record for debugging
       trace.push({ event, timestamp: Date.now() });
 
+      if (event.type === 'stream_retry') {
+        get().updateOperationMetadata?.(operationId, {
+          streamRetry: toStreamRetryMetadata(event, adapterType),
+        });
+        return;
+      }
+
+      if (get().operations?.[operationId]?.metadata?.streamRetry) {
+        get().updateOperationMetadata?.(operationId, { streamRetry: undefined });
+      }
+
       // ─── agent_intervention_request: CC AskUserQuestion needs user input ───
       // Stamp the canonical `pluginIntervention.status='pending'` on the
       // matching tool message via `optimisticUpdateMessagePlugin` — that
@@ -1528,37 +1822,19 @@ export const executeHeterogeneousAgent = async (
       // rendered automatically by the framework while pending; the
       // eventual `tool_result` content (formatted answer text) gets
       // overwritten via the existing `tool_result` branch below.
-      // Deferred behind `persistQueue` so it lands AFTER `persistToolBatch`
-      // populates `toolMsgIdByCallId`.
+      // Deferred behind `persistQueue`; if the bridge event beats the stdout
+      // tool_use event, cache it and replay once the tool id is registered.
       if (event.type === 'agent_intervention_request') {
         const data = event.data as AgentInterventionRequestData;
         persistQueue = persistQueue.then(async () => {
-          const toolMsgId = toolMsgIdByCallId.get(data.toolCallId);
-          if (!toolMsgId) {
+          if (await applyInterventionRequest(data)) return;
+
+          pendingInterventionRequests.set(data.toolCallId, data);
+          if (!toolMsgIdByCallId.has(data.toolCallId)) {
             console.warn(
-              '[HeterogeneousAgent] intervention_request for unknown toolCallId:',
+              '[HeterogeneousAgent] deferred intervention_request for unknown toolCallId:',
               data.toolCallId,
             );
-            return;
-          }
-          try {
-            await get().optimisticUpdateMessagePlugin(
-              toolMsgId,
-              { intervention: { status: 'pending' } },
-              { operationId },
-            );
-            // Sidebar topic row swaps the running spinner for a hand icon
-            // so it's obvious from the topic list that this conversation is
-            // blocked on the user, not still streaming.
-            writeTopicStatus('waitingForHuman');
-            // Parity with the homogeneous approval paths (client / gateway /
-            // aiAgent): a CC AskUserQuestion now also bumps the dock badge and
-            // bounces the macOS dock. The helper is desktop-guarded and only
-            // requests attention while the window is hidden/unfocused, so it's
-            // a no-op when the user is already looking at the approval.
-            void notifyDesktopHumanApprovalRequired(get, context);
-          } catch (err) {
-            console.error('[HeterogeneousAgent] persist intervention pending failed:', err);
           }
         });
         return;
@@ -1574,30 +1850,9 @@ export const executeHeterogeneousAgent = async (
       // a Submit click would throw `Operation not found`).
       if (event.type === 'agent_intervention_response') {
         const data = event.data as AgentInterventionResponseData;
-        const { cancelled, cancelReason, toolCallId } = data;
-        if (!cancelled) return;
-        if (cancelReason === 'user_cancelled') return;
         persistQueue = persistQueue.then(async () => {
-          const toolMsgId = toolMsgIdByCallId.get(toolCallId);
-          if (!toolMsgId) return;
-          try {
-            await get().optimisticUpdateMessagePlugin(
-              toolMsgId,
-              {
-                intervention: {
-                  rejectedReason: cancelReason ?? 'session_ended',
-                  status: 'rejected',
-                },
-              },
-              { operationId },
-            );
-            // Bridge resolved without the user — drop the hand state so the
-            // sidebar reflects that we're back to whatever the stream does
-            // next (`active`/`failed` lands shortly after via runtime_end).
-            writeTopicStatus('running');
-          } catch (err) {
-            console.error('[HeterogeneousAgent] persist intervention rejection failed:', err);
-          }
+          if (await applyInterventionResponse(data)) return;
+          pendingInterventionResponses.set(data.toolCallId, data);
         });
         return;
       }
@@ -1652,6 +1907,7 @@ export const executeHeterogeneousAgent = async (
       // which would read stale DB state (before we persist final content + usage).
       if (event.type === 'agent_runtime_end' || event.type === 'error') {
         deferredTerminalEvent = event;
+        notifyTerminalEvent();
         return;
       }
 
@@ -1698,26 +1954,31 @@ export const executeHeterogeneousAgent = async (
 
       // Forward to the unified Gateway handler.
       //
-      // Events that drive `fetchAndReplaceMessages` on the handler side
-      // (`tool_end`, `step_complete:execution_complete`, `stream_chunk` with a
-      // server-attached `toolMessageIds`) must wait for `persistQueue` to drain
-      // — otherwise the handler reads `assistant.tools[]` while a parallel
-      // `persistToolBatch` is still mid-flight and `replaceMessages` clobbers
-      // the in-memory cumulative tools[] with a shorter snapshot. That's the
-      // "7 → 6 tool-calls" rollback users see on parallel CC tool batches.
+      // Events that used to drive `fetchAndReplaceMessages` on the handler side
+      // (`tool_end`, `step_complete:execution_complete`) now wait only for the
+      // reducer to settle local raw-message SoT, then tell the handler to skip
+      // the DB fetch. This keeps parallel tool batches from being overwritten by
+      // a stale DB snapshot while write-behind batchMutate drains independently.
+      // `stream_chunk` with server-attached `toolMessageIds` still fetches: that
+      // path means the server created rows the client does not have locally.
       //
       // Other forwards (text / reasoning / tools_calling dispatches) stay
       // synchronous so live streaming UX isn't gated on DB round-trips.
-      const triggersFetchAndReplace =
+      attachInitialAssistantSeed(event);
+      const hasFrontendSotReconciliation =
         event.type === 'tool_end' ||
         (event.type === 'step_complete' &&
-          (event.data as { phase?: string } | undefined)?.phase === 'execution_complete') ||
+          (event.data as { phase?: string } | undefined)?.phase === 'execution_complete');
+      const triggersFetchAndReplace =
+        hasFrontendSotReconciliation ||
         (event.type === 'stream_chunk' &&
           (event.data as { toolMessageIds?: unknown } | undefined)?.toolMessageIds !== undefined);
 
       if (pendingStepTransition || triggersFetchAndReplace) {
         persistQueue = persistQueue.then(async () => {
-          if (triggersFetchAndReplace) {
+          if (hasFrontendSotReconciliation) {
+            markSkipMessageFetch(event);
+          } else if (triggersFetchAndReplace) {
             await messageWriteBatcher.flush('before-fetch-replace');
           }
           eventHandler(event);
@@ -1730,177 +1991,206 @@ export const executeHeterogeneousAgent = async (
     unsubscribe = subscribeBroadcasts(agentSessionId, {
       onStreamEvent: handleStreamEvent,
 
-      onComplete: async () => {
-        if (completed) return;
-        completed = true;
+      onComplete: () => {
+        void runCompletionCallback(async () => {
+          if (completed) return;
+          completed = true;
 
-        const isErrorTerminal = deferredTerminalEvent?.type === 'error';
-
-        // Reset the sidebar "running" status BEFORE awaiting the persist queue.
-        // Topic status is independent of message persistence, so a stalled queue
-        // (e.g. a subagent-heavy run whose final DB write never settles) must not
-        // strand the topic spinning after the CLI has exited — the stuck-spinner
-        // this guards against. Content persistence + the terminal forward still
-        // wait for queued reducer state so terminal never flushes stale content.
-        {
-          const reason = (deferredTerminalEvent?.data as { reason?: string } | undefined)?.reason;
-          if (isErrorTerminal) {
-            writeTopicStatus('failed');
-          } else if (!isAborted() && isCompletedRuntimeEnd(reason)) {
-            // Clean completion: the viewer sees 'active'; a background topic gets
-            // the unread badge (markTopicUnread self-guards on activeTopicId).
-            if (get().activeTopicId === context.topicId) writeTopicStatus('active');
-            else
-              get().markTopicUnread?.({
-                agentId: context.agentId,
-                groupId: context.groupId,
-                topicId: context.topicId,
-              });
-          } else {
-            // Cancel / deferred-tool park — back to a neutral 'active'.
-            writeTopicStatus('active');
+          if (!isAborted() && !deferredTerminalEvent) {
+            await waitForTerminalEvent(HETERO_TERMINAL_EVENT_GRACE_TIMEOUT_MS);
           }
-        }
 
-        const terminalEvent: AgentStreamEvent = deferredTerminalEvent ?? {
-          data: {},
-          operationId,
-          stepIndex: 0,
-          timestamp: Date.now(),
-          type: 'agent_runtime_end',
-        };
-        let finalContent = '';
+          const isErrorTerminal = deferredTerminalEvent?.type === 'error';
 
-        // Reduce the terminal event through the shared coordinator: it flushes
-        // the last step's content/reasoning/model (with echo suppression), and
-        // — for an error terminal — emits `setError` → `persistTerminalError`
-        // (full error UI). It also drains any subagent run that never saw its
-        // parent tool_result (CLI crashed mid-subagent, or the spawn's
-        // tool_result arrived after the stream closed), flushing each run's
-        // trailing content and marking the thread Active. Queue this terminal
-        // reduce behind every prior stream event: content chunks are live-UI
-        // only until the reducer accumulates them, so a timeout-based drain
-        // would let terminal flush read a stale `mainState`.
-        persistQueue = persistQueue.then(async () => {
-          // Snapshot the final content BEFORE terminal reduce resets the
-          // accumulator — used for the completion notification body below.
-          finalContent = mainState.accContent;
-          await reduceAndApplyMain(terminalEvent);
-          await messageWriteBatcher.flush('terminal');
-        });
-        const queueDrained = await waitForPersistQueue(persistQueue, 'terminal');
-
-        if (queueDrained) {
-          for (const [messageId, messageToCreate] of pendingMainCreates) {
-            try {
-              await messageService.createMessage(messageToCreate);
-              pendingMainCreates.delete(messageId);
-            } catch (err) {
-              console.error('[HeterogeneousAgent] Failed to replay main assistant create:', err);
+          // Reset the sidebar "running" status BEFORE awaiting the persist queue.
+          // Topic status is independent of message persistence, so a stalled queue
+          // (e.g. a subagent-heavy run whose final DB write never settles) must not
+          // strand the topic spinning after the CLI has exited — the stuck-spinner
+          // this guards against. Content persistence + the terminal forward still
+          // wait for queued reducer state so terminal never flushes stale content.
+          {
+            const reason = (deferredTerminalEvent?.data as { reason?: string } | undefined)?.reason;
+            if (isErrorTerminal) {
+              writeTopicStatus('failed');
+            } else if (!isAborted() && isCompletedRuntimeEnd(reason)) {
+              // Clean completion: the viewer sees 'active'; a background topic gets
+              // the unread badge (markTopicUnread self-guards on activeTopicId).
+              if (get().activeTopicId === context.topicId) writeTopicStatus('active');
+              else
+                get().markTopicUnread?.({
+                  agentId: context.agentId,
+                  groupId: context.groupId,
+                  topicId: context.topicId,
+                });
+            } else {
+              // Cancel / deferred-tool park — back to a neutral 'active'.
+              writeTopicStatus('active');
             }
           }
 
-          for (const [messageId, update] of pendingMainFlush) {
-            try {
-              await updateMessageOrThrow(messageId, update);
-              pendingMainFlush.delete(messageId);
-            } catch (err) {
-              console.error('[HeterogeneousAgent] Failed to replay main assistant flush:', err);
-            }
-          }
-
-          // Replay any subagent flush that failed transiently mid-stream, pinned
-          // to its original in-thread assistant (NOT the terminal row).
-          for (const [threadId, pending] of pendingSubagentFlush) {
-            const update: Record<string, any> = {};
-            if (pending.content) update.content = pending.content;
-            if (pending.reasoning) update.reasoning = { content: pending.reasoning };
-            if (Object.keys(update).length === 0) continue;
-            try {
-              await messageService.updateMessage(pending.messageId, update, {
-                agentId: context.agentId,
-                topicId: context.topicId,
-              });
-              subagentThreads.get(threadId)?.stream.update(pending.messageId, update);
-            } catch (err) {
-              console.error('[HeterogeneousAgent] Failed to replay subagent flush:', err);
-            }
-          }
-          pendingSubagentFlush.clear();
-        }
-
-        if (!isErrorTerminal) {
-          // Topic status was already reset ahead of the queue (top of
-          // onComplete); forward the deferred terminal only so the handler runs
-          // the final fetchAndReplaceMessages + completeOperation against the
-          // now-persisted state.
-          eventHandler(terminalEvent);
-          if (!queueDrained) get().completeOperation(operationId);
-        }
-
-        // Signal completion to the user — dock badge + (window-hidden) notification,
-        // delegated to the shared `afterRunComplete` hook. It does the same
-        // showNotification + setBadgeCount fan-out for non-client runtimes. We pass
-        // the in-memory accumulated content (the store snapshot isn't durable yet);
-        // the shared helper strips markdown + caps length + resolves the title.
-        // Skip for aborted runs and for error terminations.
-        if (!isAborted() && !isErrorTerminal) {
-          await runLifecycle.afterRunComplete({
-            context,
-            notification: { content: finalContent },
+          const terminalEvent: AgentStreamEvent = deferredTerminalEvent ?? {
+            data: {},
             operationId,
-            runId: operationId,
-            runScope,
-            runtimeType: 'hetero',
+            stepIndex: 0,
+            timestamp: Date.now(),
+            type: 'agent_runtime_end',
+          };
+          let finalContent = '';
+
+          // Reduce the terminal event through the shared coordinator: it flushes
+          // the last step's content/reasoning/model (with echo suppression), and
+          // — for an error terminal — emits `setError` → `persistTerminalError`
+          // (full error UI). It also drains any subagent run that never saw its
+          // parent tool_result (CLI crashed mid-subagent, or the spawn's
+          // tool_result arrived after the stream closed), flushing each run's
+          // trailing content and marking the thread Active. Queue this terminal
+          // reduce behind every prior stream event: content chunks are live-UI
+          // only until the reducer accumulates them, so a timeout-based drain
+          // would let terminal flush read a stale `mainState`.
+          persistQueue = persistQueue.then(async () => {
+            // Snapshot the final content BEFORE terminal reduce resets the
+            // accumulator — used for the completion notification body below.
+            finalContent = mainState.accContent;
+            await reduceAndApplyMain(terminalEvent);
+            await messageWriteBatcher.flush('terminal');
           });
-        }
+          const queueDrained = await waitForPersistQueue(persistQueue, 'terminal');
+
+          if (queueDrained) {
+            // Order is load-bearing: rows first, in the order they were enqueued
+            // (that is their FK dependency order), then the content patches —
+            // an update against a row that does not exist yet matches zero rows.
+            for (const [messageId, messageToCreate] of pendingCreates) {
+              try {
+                await messageService.createMessage(messageToCreate);
+                pendingCreates.delete(messageId);
+              } catch (err) {
+                console.error('[HeterogeneousAgent] Failed to replay message create:', err);
+              }
+            }
+
+            for (const [messageId, update] of pendingMainFlush) {
+              try {
+                await updateMessageOrThrow(messageId, update);
+                pendingMainFlush.delete(messageId);
+              } catch (err) {
+                console.error('[HeterogeneousAgent] Failed to replay main assistant flush:', err);
+              }
+            }
+
+            for (const [messageId, update] of pendingToolFlush) {
+              try {
+                const result = await messageService.updateToolMessage(messageId, update, {
+                  agentId: context.agentId,
+                  topicId: context.topicId,
+                });
+                if (result?.success === false) {
+                  throw new Error(`updateToolMessage returned success=false for ${messageId}`);
+                }
+                pendingToolFlush.delete(messageId);
+              } catch (err) {
+                console.error('[HeterogeneousAgent] Failed to replay tool flush:', err);
+              }
+            }
+
+            // Replay any subagent flush that failed transiently mid-stream, pinned
+            // to its original in-thread assistant (NOT the terminal row).
+            for (const [threadId, pending] of pendingSubagentFlush) {
+              const update: Record<string, any> = {};
+              if (pending.content) update.content = pending.content;
+              if (pending.reasoning) update.reasoning = { content: pending.reasoning };
+              if (Object.keys(update).length === 0) continue;
+              try {
+                await messageService.updateMessage(pending.messageId, update, {
+                  agentId: context.agentId,
+                  topicId: context.topicId,
+                });
+                subagentThreads.get(threadId)?.stream.update(pending.messageId, update);
+              } catch (err) {
+                console.error('[HeterogeneousAgent] Failed to replay subagent flush:', err);
+              }
+            }
+            pendingSubagentFlush.clear();
+          }
+
+          if (!isErrorTerminal) {
+            // Topic status was already reset ahead of the queue (top of
+            // onComplete); forward the deferred terminal with the current
+            // frontend SoT so the handler can complete the operation without a
+            // DB refresh that may race write-behind batchMutate.
+            attachTerminalFrontendSnapshot(terminalEvent);
+            eventHandler(terminalEvent);
+            if (!queueDrained) get().completeOperation(operationId);
+          }
+
+          // Signal completion to the user — dock badge + (window-hidden) notification,
+          // delegated to the shared `afterRunComplete` hook. It does the same
+          // showNotification + setBadgeCount fan-out for non-client runtimes. We pass
+          // the in-memory accumulated content (the store snapshot isn't durable yet);
+          // the shared helper strips markdown + caps length + resolves the title.
+          // Skip for aborted runs and for error terminations.
+          if (!isAborted() && !isErrorTerminal) {
+            await runLifecycle.afterRunComplete({
+              context,
+              notification: { content: finalContent },
+              operationId,
+              runId: operationId,
+              runScope,
+              runtimeType: 'hetero',
+            });
+          }
+        });
       },
 
-      onError: async (error) => {
-        if (completed) return;
-        if (retryWithoutResume(error)) return;
-        completed = true;
+      onError: (error) => {
+        void runCompletionCallback(async () => {
+          if (completed) return;
+          if (retryWithoutResume(error)) return;
+          completed = true;
 
-        // Reset status ahead of the queue (see onComplete) so a stalled queue
-        // can't strand the spinner; persistTerminalError below re-asserts 'failed'
-        // with the full error UI.
-        writeTopicStatus(isAborted() ? 'active' : 'failed');
+          // Reset status ahead of the queue (see onComplete) so a stalled queue
+          // can't strand the spinner; persistTerminalError below re-asserts 'failed'
+          // with the full error UI.
+          writeTopicStatus(isAborted() ? 'active' : 'failed');
 
-        const deferredMessageError =
-          deferredTerminalEvent?.type === 'error'
-            ? toHeterogeneousAgentMessageError(deferredTerminalEvent.data, adapterType)
-            : undefined;
-        const messageError =
-          deferredMessageError || toHeterogeneousAgentMessageError(error, adapterType);
-        let shouldClearTerminalErrorContent = false;
+          const deferredMessageError =
+            deferredTerminalEvent?.type === 'error'
+              ? toHeterogeneousAgentMessageError(deferredTerminalEvent.data, adapterType)
+              : undefined;
+          const messageError =
+            deferredMessageError || toHeterogeneousAgentMessageError(error, adapterType);
+          let shouldClearTerminalErrorContent = false;
 
-        persistQueue = persistQueue.then(async () => {
-          shouldClearTerminalErrorContent = shouldSuppressTerminalErrorEcho(
-            mainState.accContent,
-            messageError,
-          );
-
-          if (mainState.accContent && !shouldClearTerminalErrorContent) {
-            messageWriteBatcher.enqueueUpdateMessage(
-              mainState.currentAssistantId,
-              { content: mainState.accContent },
-              messageWriteCtx,
-              console.error,
+          persistQueue = persistQueue.then(async () => {
+            shouldClearTerminalErrorContent = shouldSuppressTerminalErrorEcho(
+              mainState.accContent,
+              messageError,
             );
+
+            if (mainState.accContent && !shouldClearTerminalErrorContent) {
+              messageWriteBatcher.enqueueUpdateMessage(
+                mainState.currentAssistantId,
+                { content: mainState.accContent },
+                messageWriteCtx,
+                console.error,
+              );
+            }
+            await messageWriteBatcher.flush('error');
+          });
+          await waitForPersistQueue(persistQueue, 'error');
+
+          // If the error came from a user-initiated cancel (SIGINT → non-zero
+          // exit), don't surface it as a runtime error toast — the operation is
+          // already marked cancelled and the partial content is persisted above.
+          if (isAborted()) {
+            writeTopicStatus('active');
+            return;
           }
-          await messageWriteBatcher.flush('error');
+
+          await persistTerminalError(messageError, {
+            clearContent: shouldClearTerminalErrorContent,
+          });
         });
-        await waitForPersistQueue(persistQueue, 'error');
-
-        // If the error came from a user-initiated cancel (SIGINT → non-zero
-        // exit), don't surface it as a runtime error toast — the operation is
-        // already marked cancelled and the partial content is persisted above.
-        if (isAborted()) {
-          writeTopicStatus('active');
-          return;
-        }
-
-        await persistTerminalError(messageError, { clearContent: shouldClearTerminalErrorContent });
       },
     });
 
@@ -1923,6 +2213,7 @@ export const executeHeterogeneousAgent = async (
     } else {
       await heterogeneousAgentService.sendPrompt(agentSessionId, message, operationId, imageList);
     }
+    await waitForCompletionCallback();
 
     // Persist heterogeneous-agent session id + the cwd it was created under,
     // for multi-turn resume. CC stores sessions per-cwd
@@ -2025,6 +2316,7 @@ export const executeHeterogeneousAgent = async (
       });
     }
   } finally {
+    await waitForCompletionCallback();
     unsubscribe?.();
     // Don't stopSession here — keep it alive for multi-turn resume.
     // Session cleanup happens on topic deletion or Electron quit.

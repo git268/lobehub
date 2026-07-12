@@ -1,4 +1,5 @@
 import { isDesktop } from '@lobechat/const';
+import { getActivePluginIds } from '@lobechat/types';
 import { ActionIcon, DropdownMenu, Flexbox, Icon } from '@lobehub/ui';
 import { confirmModal, type ModalInstance } from '@lobehub/ui/base-ui';
 import isEqual from 'fast-deep-equal';
@@ -35,7 +36,6 @@ import { selectors as profileSelectors, useProfileStore } from '../store';
 import AgentForkTag from './AgentForkTag';
 import AgentStatusTag from './AgentStatusTag';
 import AgentVersionReviewTag from './AgentVersionReviewTag';
-import AutoSaveHint from './AutoSaveHint';
 
 type HeaderTranslation = TFunction<
   readonly ['setting', 'chat', 'file', 'common', 'spend'],
@@ -132,7 +132,9 @@ const Header = memo(() => {
       const profileMarkdown = buildAgentProfileMarkdown({
         description: meta?.description,
         model: config.model,
-        plugins: config.plugins,
+        // Pinned identifiers only — a disabled plugin shouldn't be advertised
+        // as "enabled" in the exported markdown.
+        plugins: getActivePluginIds(config.plugins),
         provider: config.provider,
         systemRole: editorMarkdown ?? systemRole,
         t,
@@ -244,13 +246,11 @@ const Header = memo(() => {
 
   return (
     <NavHeader
-      styles={{ left: { paddingInlineStart: 24 } }}
       left={
         <Flexbox horizontal align={'center'} gap={8}>
           {activeAgentId && (
             <AgentBreadcrumb agentId={activeAgentId} title={t('tab.profile', { ns: 'chat' })} />
           )}
-          <AutoSaveHint />
           <AgentStatusTag />
           <AgentVersionReviewTag />
           <AgentForkTag />
@@ -271,6 +271,11 @@ const Header = memo(() => {
           )}
         </Flexbox>
       }
+      styles={{
+        left: {
+          paddingInlineStart: 8,
+        },
+      }}
     />
   );
 });

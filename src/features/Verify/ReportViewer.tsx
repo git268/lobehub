@@ -11,6 +11,7 @@ import { toRecord } from '@lobechat/utils/object';
 import {
   Block,
   Center,
+  Drawer,
   Empty,
   Flexbox,
   Highlighter,
@@ -19,7 +20,7 @@ import {
   Markdown,
   Text,
 } from '@lobehub/ui';
-import { Button, Modal } from '@lobehub/ui/base-ui';
+import { Button } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import type { TFunction } from 'i18next';
 import {
@@ -73,7 +74,7 @@ const styles = createStaticStyles(({ css }) => ({
   `,
   page: css`
     width: 100%;
-    max-width: 840px;
+    max-width: 1180px;
     margin-inline: auto;
     padding-block: 32px 64px;
     padding-inline: 32px;
@@ -1230,31 +1231,50 @@ const EvidenceFileButton = memo<{
 
 EvidenceFileButton.displayName = 'EvidenceFileButton';
 
-/** Modal gallery of one check's evidence — one section per artifact, by type. */
-const EvidenceModal = memo<{
+/** Right-side evidence gallery — one section per artifact, by type. */
+const EvidenceDrawer = memo<{
   evidence: VerifyEvidenceWithUrl[];
   onClose: () => void;
   open: boolean;
   title: string;
 }>(({ evidence, onClose, open, title }) => (
-  <Modal
-    footer={null}
+  <Drawer
+    destroyOnHidden
+    containerMaxWidth={'100%'}
     open={open}
+    placement={'right'}
     title={title}
-    width={'min(760px, 92vw)'}
-    onCancel={() => onClose()}
+    width={'min(1120px, calc(100vw - 48px))'}
+    styles={{
+      body: {
+        height: '100%',
+        padding: 0,
+      },
+      bodyContent: {
+        height: '100%',
+        minHeight: 0,
+        overflow: 'hidden',
+      },
+    }}
+    onClose={onClose}
   >
-    <Flexbox gap={20} style={{ maxHeight: '68vh', overflow: 'auto', paddingBlock: 4 }}>
+    <Flexbox
+      gap={20}
+      height={'100%'}
+      paddingBlock={12}
+      paddingInline={16}
+      style={{ overflow: 'auto' }}
+    >
       {evidence.map((e, index) => (
         <EvidenceItem evidence={e} index={index + 1} key={e.id} />
       ))}
     </Flexbox>
-  </Modal>
+  </Drawer>
 ));
 
 EvidenceItem.displayName = 'EvidenceItem';
 
-EvidenceModal.displayName = 'EvidenceModal';
+EvidenceDrawer.displayName = 'EvidenceDrawer';
 
 /** One check — an expandable row; evidence opens one artifact at a time. */
 const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }>(
@@ -1337,7 +1357,7 @@ const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }
                   )}
                 </div>
                 {selectedEvidence && (
-                  <EvidenceModal
+                  <EvidenceDrawer
                     evidence={[selectedEvidence]}
                     open={Boolean(selectedEvidence)}
                     title={evidenceDisplayName(selectedEvidence, t, selectedEvidenceIndex + 1)}
@@ -1511,10 +1531,14 @@ CodingScopeCard.displayName = 'CodingScopeCard';
  * and the full narrative behind a collapsed disclosure. Addressed by `:runId`;
  * refreshes itself while the run is non-terminal.
  */
-const ReportViewer = memo(() => {
+interface ReportViewerProps {
+  runId?: string;
+}
+
+const ReportViewer = memo<ReportViewerProps>(({ runId: explicitRunId }) => {
   const { t } = useTranslation('verify');
-  const { runId } = useParams<{ runId: string }>();
-  const verifyRunId = runId ?? null;
+  const { runId: routeRunId } = useParams<{ runId: string }>();
+  const verifyRunId = explicitRunId ?? routeRunId ?? null;
   const { data, error, isLoading, mutate } = useVerifyReportBundle(verifyRunId);
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -1603,96 +1627,101 @@ const ReportViewer = memo(() => {
   return (
     <div className={styles.scroll}>
       <div className={styles.page}>
-        <Flexbox gap={12}>
-          <div className={styles.heroLine}>
-            {verdict && (
-              <span
-                className={styles.pill}
-                style={{ background: VERDICT_META[verdict].bg, color: VERDICT_META[verdict].color }}
+        <main>
+          <Flexbox gap={12}>
+            <div className={styles.heroLine}>
+              {verdict && (
+                <span
+                  className={styles.pill}
+                  style={{
+                    background: VERDICT_META[verdict].bg,
+                    color: VERDICT_META[verdict].color,
+                  }}
+                >
+                  <Icon icon={VERDICT_META[verdict].icon} size={15} />
+                  {t(`report.verdict.${verdict}`)}
+                </span>
+              )}
+              <Text as={'h1'} style={{ fontSize: 24, lineHeight: 1.3, margin: 0 }}>
+                {run.title || t('report.titleFallback')}
+              </Text>
+            </div>
+
+            {!isCodingReport && run.goal && <Text className={styles.summary}>{run.goal}</Text>}
+            {report?.summary && <Text className={styles.summary}>{report.summary}</Text>}
+
+            {isCodingReport && <CodingScopeCard context={run.context} />}
+
+            {liveStatus && (
+              <div className={styles.liveBanner}>
+                <Icon icon={Clock3} size={14} />
+                {t(liveStatusLabelKey[liveStatus])}
+              </div>
+            )}
+          </Flexbox>
+
+          <div className={styles.stats}>
+            {chips.map((c) => (
+              <button
+                className={styles.chip}
+                data-active={filter === c.key}
+                key={c.key}
+                type={'button'}
+                onClick={() => setFilter(c.key)}
               >
-                <Icon icon={VERDICT_META[verdict].icon} size={15} />
-                {t(`report.verdict.${verdict}`)}
+                {c.dot && <span className={styles.dot} style={{ background: c.dot }} />}
+                {c.label} <b>{c.count}</b>
+              </button>
+            ))}
+            {typeof report?.overallConfidence === 'number' && (
+              <span className={`${styles.chip} ${styles.score}`}>
+                {t('report.stats.confidence')} <b>{Math.round(report.overallConfidence * 100)}%</b>
               </span>
             )}
-            <Text as={'h1'} style={{ fontSize: 24, lineHeight: 1.3, margin: 0 }}>
-              {run.title || t('report.titleFallback')}
-            </Text>
           </div>
 
-          {!isCodingReport && run.goal && <Text className={styles.summary}>{run.goal}</Text>}
-          {report?.summary && <Text className={styles.summary}>{report.summary}</Text>}
-
-          {isCodingReport && <CodingScopeCard context={run.context} />}
-
-          {liveStatus && (
-            <div className={styles.liveBanner}>
-              <Icon icon={Clock3} size={14} />
-              {t(liveStatusLabelKey[liveStatus])}
+          {visible.length > 0 ? (
+            <div className={styles.checks}>
+              {visible.map((r) => (
+                <CheckRow
+                  key={r.id}
+                  result={r}
+                  defaultOpen={
+                    checkVerdict(r) === 'failed' || r.evidence.some(isInlineVisualEvidence)
+                  }
+                />
+              ))}
             </div>
+          ) : (
+            <Block align={'center'} padding={24}>
+              <Text type={'secondary'}>{t('report.filterEmpty')}</Text>
+            </Block>
           )}
-        </Flexbox>
 
-        <div className={styles.stats}>
-          {chips.map((c) => (
-            <button
-              className={styles.chip}
-              data-active={filter === c.key}
-              key={c.key}
-              type={'button'}
-              onClick={() => setFilter(c.key)}
-            >
-              {c.dot && <span className={styles.dot} style={{ background: c.dot }} />}
-              {c.label} <b>{c.count}</b>
-            </button>
-          ))}
-          {typeof report?.overallConfidence === 'number' && (
-            <span className={`${styles.chip} ${styles.score}`}>
-              {t('report.stats.confidence')} <b>{Math.round(report.overallConfidence * 100)}%</b>
-            </span>
+          {report?.content && (
+            <details className={styles.narrative}>
+              <summary className={styles.narrativeSummary}>
+                <Icon icon={ChevronRight} size={13} />
+                {t('report.sections.details')}
+              </summary>
+              <div className={styles.narrativeBody}>
+                <Markdown>{report.content}</Markdown>
+              </div>
+            </details>
           )}
-        </div>
 
-        {visible.length > 0 ? (
-          <div className={styles.checks}>
-            {visible.map((r) => (
-              <CheckRow
-                key={r.id}
-                result={r}
-                defaultOpen={
-                  checkVerdict(r) === 'failed' || r.evidence.some(isInlineVisualEvidence)
-                }
-              />
-            ))}
-          </div>
-        ) : (
-          <Block align={'center'} padding={24}>
-            <Text type={'secondary'}>{t('report.filterEmpty')}</Text>
-          </Block>
-        )}
-
-        {report?.content && (
-          <details className={styles.narrative}>
-            <summary className={styles.narrativeSummary}>
-              <Icon icon={ChevronRight} size={13} />
-              {t('report.sections.details')}
-            </summary>
-            <div className={styles.narrativeBody}>
-              <Markdown>{report.content}</Markdown>
-            </div>
-          </details>
-        )}
-
-        {interactionCost && (
-          <details className={styles.narrative}>
-            <summary className={styles.narrativeSummary}>
-              <Icon icon={ChevronRight} size={13} />
-              {t('report.interaction.title')}
-            </summary>
-            <div className={styles.interactionCostBody}>
-              <InteractionCostPanel cost={interactionCost} />
-            </div>
-          </details>
-        )}
+          {interactionCost && (
+            <details className={styles.narrative}>
+              <summary className={styles.narrativeSummary}>
+                <Icon icon={ChevronRight} size={13} />
+                {t('report.interaction.title')}
+              </summary>
+              <div className={styles.interactionCostBody}>
+                <InteractionCostPanel cost={interactionCost} />
+              </div>
+            </details>
+          )}
+        </main>
       </div>
     </div>
   );

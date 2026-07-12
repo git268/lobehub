@@ -121,7 +121,9 @@ function setupIpcCapture() {
         on: vi.fn((channel: string, handler: (...args: any[]) => void) => {
           listeners.set(channel, handler);
         }),
-        removeListener: vi.fn(),
+        removeListener: vi.fn((channel: string, handler: (...args: any[]) => void) => {
+          if (listeners.get(channel) === handler) listeners.delete(channel);
+        }),
       },
     },
   };
@@ -180,6 +182,19 @@ function setupIpcCapture() {
           sessionId,
         });
       }
+    },
+    /** Emit an already-adapted AgentStreamEvent, matching main-process bridge events. */
+    emitStreamEvent: (sessionId: string, event: Record<string, unknown>) => {
+      const handler = listeners.get('heteroAgentEvent');
+      handler?.(null, {
+        event: {
+          operationId: defaultParams.operationId,
+          stepIndex: 0,
+          timestamp: Date.now(),
+          ...event,
+        },
+        sessionId,
+      });
     },
     /** Simulate session completion */
     emitComplete: (sessionId: string) => {
@@ -550,8 +565,11 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
    * Runs the executor in background, then feeds CC events and completes.
    * Returns a promise that resolves when the executor finishes.
    */
-  async function runWithEvents(ccEvents: any[], opts?: { params?: Partial<typeof defaultParams> }) {
-    const store = createMockStore();
+  async function runWithEvents(
+    ccEvents: any[],
+    opts?: { params?: Partial<typeof defaultParams>; store?: any },
+  ) {
+    const store = opts?.store ?? createMockStore();
     const get = vi.fn(() => store);
 
     // sendPrompt will resolve after we emit all events
@@ -589,6 +607,69 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
 
     return { get, store };
   }
+
+  it('surfaces stream_retry metadata on the running operation and clears it on the next event', async () => {
+    const store = createMockStore();
+    const get = vi.fn(() => store);
+
+    let resolveSendPrompt: () => void;
+    mockSendPrompt.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveSendPrompt = resolve;
+      }),
+    );
+
+    const executorPromise = executeHeterogeneousAgent(get, defaultParams);
+    await flush();
+
+    ipc.emitStreamEvent('ipc-sess-1', {
+      data: {
+        attempt: 6,
+        delayMs: 1000,
+        error: 'overloaded',
+        errorStatus: 529,
+        maxAttempts: 10,
+        provider: 'anthropic',
+      },
+      type: 'stream_retry',
+    });
+    await flush();
+
+    expect(store.updateOperationMetadata).toHaveBeenCalledWith('op-1', {
+      streamRetry: expect.objectContaining({
+        agentType: 'claude-code',
+        attempt: 6,
+        delayMs: 1000,
+        error: 'overloaded',
+        errorStatus: 529,
+        maxAttempts: 10,
+        provider: 'anthropic',
+      }),
+    });
+    expect(store.operations['op-1'].metadata.streamRetry).toMatchObject({
+      attempt: 6,
+      error: 'overloaded',
+      errorStatus: 529,
+    });
+
+    ipc.emitStreamEvent('ipc-sess-1', {
+      data: {},
+      type: 'agent_runtime_init',
+    });
+    await flush();
+
+    expect(store.updateOperationMetadata).toHaveBeenCalledWith('op-1', {
+      streamRetry: undefined,
+    });
+    expect(store.operations['op-1'].metadata.streamRetry).toBeUndefined();
+
+    ipc.emitComplete('ipc-sess-1');
+    await flush();
+    resolveSendPrompt!();
+    await flush();
+    await executorPromise;
+    await flush();
+  });
 
   // ────────────────────────────────────────────────────
   // Tool 3-phase persistence
@@ -672,7 +753,94 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         types.filter((type: string) => type === 'updateMessage').length,
       ).toBeGreaterThanOrEqual(2);
       expect(types.filter((type: string) => type === 'createMessage')).toHaveLength(1);
-      expect(types.at(-1)).toBe('updateToolMessage');
+      expect(types.filter((type: string) => type === 'updateToolMessage')).toHaveLength(1);
+      expect(types.indexOf('updateToolMessage')).toBeGreaterThan(types.indexOf('createMessage'));
+    });
+
+    it('replays an early AskUserQuestion intervention after the batched tool row exists', async () => {
+      const optimisticUpdateMessagePlugin = vi.fn(async () => {});
+      const updateTopicStatus = vi.fn(async () => {});
+      const store = createMockStore({
+        optimisticUpdateMessagePlugin,
+        updateTopicStatus,
+      });
+      const get = vi.fn(() => store);
+
+      let resolveSendPrompt!: () => void;
+      mockSendPrompt.mockReturnValue(
+        new Promise<void>((resolve) => {
+          resolveSendPrompt = resolve;
+        }),
+      );
+
+      const executorPromise = executeHeterogeneousAgent(get, defaultParams);
+      await flush();
+
+      ipc.emitRawLine('ipc-sess-1', ccInit());
+      ipc.emitStreamEvent('ipc-sess-1', {
+        data: {
+          apiName: 'askUserQuestion',
+          arguments: JSON.stringify({
+            questions: [
+              {
+                header: 'Scope',
+                options: [
+                  { description: 'Keep it narrow', label: 'Small' },
+                  { description: 'Do all of it', label: 'All' },
+                ],
+                question: 'How much should I do?',
+              },
+            ],
+          }),
+          deadline: Date.now() + 300_000,
+          identifier: 'claude-code',
+          toolCallId: 'toolu_ask',
+        },
+        type: 'agent_intervention_request',
+      });
+      await flush();
+
+      expect(optimisticUpdateMessagePlugin).not.toHaveBeenCalled();
+
+      ipc.emitRawLine(
+        'ipc-sess-1',
+        ccToolUse('msg_ask', 'toolu_ask', 'mcp__lobe_cc__ask_user_question', {
+          questions: [
+            {
+              header: 'Scope',
+              options: [
+                { description: 'Keep it narrow', label: 'Small' },
+                { description: 'Do all of it', label: 'All' },
+              ],
+              question: 'How much should I do?',
+            },
+          ],
+        }),
+      );
+      await flush();
+
+      const toolCreateIndex = mockCreateMessage.mock.calls.findIndex(
+        ([params]: any) => params.role === 'tool' && params.tool_call_id === 'toolu_ask',
+      );
+      expect(toolCreateIndex).toBeGreaterThanOrEqual(0);
+      expect(optimisticUpdateMessagePlugin).toHaveBeenCalledWith(
+        mockCreateMessage.mock.calls[toolCreateIndex][0].id,
+        { intervention: { status: 'pending' } },
+        { operationId: 'op-1' },
+      );
+      expect(mockCreateMessage.mock.invocationCallOrder[toolCreateIndex]).toBeLessThan(
+        optimisticUpdateMessagePlugin.mock.invocationCallOrder[0],
+      );
+      expect(updateTopicStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'waitingForHuman', topicId: 'topic-1' }),
+      );
+
+      ipc.emitRawLine('ipc-sess-1', ccToolResult('toolu_ask', 'User answers:\n- Scope: Small'));
+      ipc.emitRawLine('ipc-sess-1', ccResult());
+      ipc.emitComplete('ipc-sess-1');
+      await flush();
+      resolveSendPrompt();
+      await executorPromise;
     });
   });
 
@@ -822,6 +990,69 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       expect(finalWrite![1].provider).toBe('claude-code');
     });
 
+    // The run's first assistant already exists in `dbMessagesMap` before the
+    // executor starts, so the gateway handler's stream_start seed-insert (its
+    // only model/provider → store path) is skipped for it. The executor must
+    // therefore mirror the flush into the store itself, or the row renders
+    // without a model until the next refetch.
+    it('should dispatch model + provider into the store for the initial assistant', async () => {
+      const seeded = [
+        {
+          agentId: 'agent-1',
+          content: '',
+          id: 'ast-initial',
+          role: 'assistant',
+          topicId: 'topic-1',
+        },
+      ];
+      const store = createMockStore({
+        dbMessagesMap: { 'main_agent-1_topic-1': seeded },
+        messagesMap: { 'main_agent-1_topic-1': seeded },
+      });
+
+      await runWithEvents([ccInit(), ccText('msg_01', 'hi'), ccResult()], { store });
+
+      const dispatched = store.internal_dispatchMessage.mock.calls.find(
+        ([payload]: any) =>
+          payload.type === 'updateMessage' &&
+          payload.id === 'ast-initial' &&
+          payload.value?.provider === 'claude-code',
+      );
+      expect(dispatched).toBeDefined();
+      expect(dispatched![0].value.model).toBe('claude-sonnet-4-6');
+    });
+
+    // `recordUsage` is the main-agent twin of the subagent interpreter's
+    // `recordUsage`, which updates its thread bucket via `stream.update`.
+    // Without the store dispatch, per-turn usage never renders live.
+    it('should dispatch turn usage into the store', async () => {
+      const store = createMockStore();
+
+      await runWithEvents(
+        [
+          ccInit(),
+          ccMessageStart('msg_01', 'claude-opus-4-6'),
+          ccAssistant('msg_01', [{ text: 'Hello', type: 'text' }], { model: 'claude-opus-4-6' }),
+          ccMessageDelta({ input_tokens: 100, output_tokens: 20 }),
+          ccResult(),
+        ],
+        { store },
+      );
+
+      const dispatched = store.internal_dispatchMessage.mock.calls.find(
+        ([payload]: any) => payload.type === 'updateMessage' && payload.value?.usage !== undefined,
+      );
+      expect(dispatched).toBeDefined();
+      expect(dispatched![0].value.model).toBe('claude-opus-4-6');
+      expect(dispatched![0].value.provider).toBe('claude-code');
+      expect(dispatched![0].value.usage).toMatchObject({
+        totalInputTokens: 100,
+        totalOutputTokens: 20,
+        totalTokens: 120,
+      });
+      expect(dispatched![0].value.metadata.usage).toBeUndefined();
+    });
+
     it('should write accumulated reasoning', async () => {
       await runWithEvents([
         ccInit(),
@@ -859,7 +1090,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       ]);
 
       const usageWrites = mockUpdateMessage.mock.calls.filter(
-        ([, val]: any) => val.metadata?.usage?.totalTokens,
+        ([, val]: any) => val.usage?.totalTokens,
       );
       // One usage write per step (msg_01 → ast-initial, msg_02 → new step assistant)
       expect(usageWrites.length).toBe(2);
@@ -869,7 +1100,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
 
       const step1 = usageWrites.find(([id]: any) => id === 'ast-initial');
       expect(step1).toBeDefined();
-      const u1 = step1![1].metadata.usage;
+      const u1 = step1![1].usage;
       // msg_01: 100 input (miss) + 200 cached + 50 cache_create = 350; 50 output
       expect(u1.totalInputTokens).toBe(350);
       expect(u1.totalOutputTokens).toBe(50);
@@ -880,7 +1111,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
 
       const step2 = usageWrites.find(([id]: any) => id === step2Id);
       expect(step2).toBeDefined();
-      const u2 = step2![1].metadata.usage;
+      const u2 = step2![1].usage;
       // msg_02: 300 input (miss, no cache); 80 output
       expect(u2.totalInputTokens).toBe(300);
       expect(u2.totalOutputTokens).toBe(80);
@@ -914,11 +1145,11 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       ]);
 
       const usageWrites = mockUpdateMessage.mock.calls.filter(
-        ([, val]: any) => val.metadata?.usage?.totalTokens,
+        ([, val]: any) => val.usage?.totalTokens,
       );
       expect(usageWrites.length).toBe(1);
-      expect(usageWrites[0][1].metadata.usage.totalOutputTokens).toBe(265); // not 1
-      expect(usageWrites[0][1].metadata.usage.totalInputTokens).toBe(6);
+      expect(usageWrites[0][1].usage.totalOutputTokens).toBe(265); // not 1
+      expect(usageWrites[0][1].usage.totalInputTokens).toBe(6);
     });
   });
 
@@ -956,6 +1187,96 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         ([id, val]: any) => id === newStepId && val.content === 'Step 2 content',
       );
       expect(newStepWrite).toBeDefined();
+    });
+  });
+
+  // ────────────────────────────────────────────────────
+  // Lost-write recovery — the tpc_mMYve6mAIT4J incident
+  // ────────────────────────────────────────────────────
+
+  describe('lost-write recovery (FK cascade)', () => {
+    /**
+     * End-to-end replay of the original incident against a fake table that
+     * enforces the two invariants the real `messages` table does:
+     *   - `parent_id` is a FK: a create whose parent row is absent throws 23503.
+     *   - an update whose id matches no row reports `success: false` (a lost
+     *     write, not a no-op) — the semantic this PR restored.
+     *
+     * A single transient `createMessage` failure orphans the seed of a spine
+     * chain (`asst → asst → asst …`); every later assistant then fails the FK,
+     * and every content flush in between lands on a row that does not exist.
+     * The fix must recover ALL of it: replay the creates in dependency order,
+     * then replay the content the zero-row updates stashed.
+     */
+    const makeFakeTable = (seedId: string) => {
+      const rows = new Map<string, any>([[seedId, { content: '', id: seedId, role: 'assistant' }]]);
+      let firstAssistantBlipped = false;
+
+      const create = async (params: any) => {
+        // Seed the cascade: the first fresh assistant create fails once, exactly
+        // like the single dropped write that started the real incident.
+        if (params.role === 'assistant' && !firstAssistantBlipped) {
+          firstAssistantBlipped = true;
+          throw new Error('transient write failure');
+        }
+        if (params.parentId && !rows.has(params.parentId)) {
+          throw new Error(`FK violation: parent ${params.parentId} is absent`);
+        }
+        rows.set(params.id, { ...params, content: params.content ?? '' });
+        return { id: params.id };
+      };
+
+      const update = async (id: string, value: any) => {
+        const row = rows.get(id);
+        if (!row) return { success: false };
+        Object.assign(row, value);
+        return { success: true };
+      };
+
+      return { create, rows, update };
+    };
+
+    it('recovers every assistant + its content after a create failure cascades down the spine', async () => {
+      const store = createMockStore({
+        dbMessagesMap: {
+          'main_agent-1_topic-1': [
+            { content: '', id: 'ast-initial', role: 'assistant', topicId: 'topic-1' },
+          ],
+        },
+      });
+      const table = makeFakeTable('ast-initial');
+      mockCreateMessage.mockImplementation(table.create);
+      mockUpdateMessage.mockImplementation(table.update);
+
+      // msg_01 reuses the seed; msg_02..04 are fresh spine assistants, each
+      // parented off the previous one — so orphaning msg_02 takes 03 and 04 too.
+      const texts = {
+        msg_01: 'seed turn answer',
+        msg_02: 'first fresh turn',
+        msg_03: 'second fresh turn',
+        msg_04: 'final answer that must survive',
+      };
+      await runWithEvents(
+        [
+          ccInit(),
+          ccText('msg_01', texts.msg_01),
+          ccText('msg_02', texts.msg_02),
+          ccText('msg_03', texts.msg_03),
+          ccText('msg_04', texts.msg_04),
+          ccResult(),
+        ],
+        { store },
+      );
+
+      // Every assistant turn is present AND carries its text — no empty shells,
+      // nothing dropped. This is the exact assertion that fails pre-fix: the
+      // content updates "succeeded" against absent rows, so the ledger that
+      // would have replayed them stayed empty.
+      const persistedContent = [...table.rows.values()]
+        .filter((r) => r.role === 'assistant')
+        .map((r) => r.content)
+        .sort();
+      expect(persistedContent).toEqual(Object.values(texts).sort());
     });
   });
 
@@ -1769,20 +2090,78 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       );
       expect(modelWrites.length).toBeGreaterThan(0);
 
-      const usageWrite = modelWrites.find(([, value]: any) => value.metadata?.usage);
+      const usageWrite = modelWrites.find(([, value]: any) => value.usage);
       expect(usageWrite?.[1]).toMatchObject({
-        metadata: {
-          usage: {
-            inputCachedTokens: 4,
-            inputCacheMissTokens: 6,
-            totalInputTokens: 10,
-            totalOutputTokens: 3,
-            totalTokens: 13,
-          },
-        },
         model: 'gpt-5.5',
         provider: 'codex',
+        usage: {
+          inputCachedTokens: 4,
+          inputCacheMissTokens: 6,
+          totalInputTokens: 10,
+          totalOutputTokens: 3,
+          totalTokens: 13,
+        },
       });
+      expect(usageWrite?.[1].metadata.usage).toBeUndefined();
+    });
+
+    it('waits for late Codex terminal events when Electron complete arrives before stdout tail', async () => {
+      const store = createMockStore();
+      const get = vi.fn(() => store);
+
+      let resolveSendPrompt: () => void;
+      mockSendPrompt.mockReturnValue(
+        new Promise<void>((r) => {
+          resolveSendPrompt = r;
+        }),
+      );
+
+      let executorSettled = false;
+      const executorPromise = executeHeterogeneousAgent(get, {
+        ...defaultParams,
+        heterogeneousProvider: { command: 'codex', type: 'codex' as const },
+      }).finally(() => {
+        executorSettled = true;
+      });
+      await flush();
+
+      ipc.emitRawLine('ipc-sess-1', codexThreadStarted());
+      ipc.emitRawLine('ipc-sess-1', codexTurnStarted());
+      ipc.emitRawLine('ipc-sess-1', codexAgentMessage('item_0', 'Checking prior state.'));
+      ipc.emitRawLine('ipc-sess-1', codexCommandStarted('item_1', '/bin/zsh -lc pwd'));
+      ipc.emitRawLine('ipc-sess-1', codexCommandCompleted('item_1', '/bin/zsh -lc pwd', '/repo\n'));
+
+      // Reproduce the Electron race: completion notification reaches the
+      // renderer before the final agent_message + turn.completed stdout tail.
+      ipc.emitComplete('ipc-sess-1');
+      await flush();
+
+      // Main resolves sendPrompt immediately after broadcasting complete. The
+      // executor must keep the IPC subscription alive while onComplete is
+      // waiting for the late terminal stdout tail.
+      resolveSendPrompt!();
+      await flush();
+      expect(executorSettled).toBe(false);
+      expect(ipc.getListeners().has('heteroAgentEvent')).toBe(true);
+
+      ipc.emitRawLine('ipc-sess-1', codexAgentMessage('item_2', 'Final report after late stdout.'));
+      ipc.emitRawLine('ipc-sess-1', codexTurnCompleted({ input_tokens: 10, output_tokens: 5 }));
+      await flush();
+
+      await executorPromise;
+      await flush();
+
+      const finalWrite = mockUpdateMessage.mock.calls.find(
+        ([, value]: any) => value.content === 'Final report after late stdout.',
+      );
+      expect(finalWrite).toBeDefined();
+
+      const finalAssistantId = finalWrite![0];
+      expect(
+        mockCreateMessage.mock.calls.some(
+          ([params]: any) => params.role === 'assistant' && params.id === finalAssistantId,
+        ),
+      ).toBe(true);
     });
 
     it('should switch to a new assistant before persisting the next turn tool', async () => {
@@ -2291,7 +2670,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
 
         expect(contentAttempts.filter((id) => id === finalAssistantId)).toHaveLength(2);
         expect(finalRow.content).toBe(finalText);
-        expect(finalRow.metadata.usage).toMatchObject({
+        expect(finalRow.usage).toMatchObject({
           inputCachedTokens: 4,
           inputCacheMissTokens: 6,
           totalInputTokens: 10,
@@ -4187,6 +4566,55 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       });
     });
 
+    it('replays a tool-parented signal assistant only after its tool row lands', async () => {
+      // A signal turn parents off the run's last TOOL row, not the spine. So a
+      // create ledger that drains every assistant before any tool row retries
+      // the signal assistant while its parent is still missing, burns its only
+      // retry on a guaranteed FK violation, and drops the turn.
+      const persisted = new Set<string>(['ast-initial']);
+      let toolCreateBlips = 1;
+      mockCreateMessage.mockImplementation(async (params: any) => {
+        // One transient failure on the tool row — the seed of the cascade.
+        if (params.role === 'tool' && toolCreateBlips > 0) {
+          toolCreateBlips -= 1;
+          throw new Error('transient write failure');
+        }
+        // Everything else obeys `messages.parent_id`, like the real table does.
+        if (params.parentId && !persisted.has(params.parentId)) {
+          throw new Error(`FK violation: parent ${params.parentId} is not present`);
+        }
+        persisted.add(params.id);
+        return { id: params.id };
+      });
+
+      await runWithEvents([
+        ccInit(),
+        ccMessageStart('msg_01'),
+        ccToolUse('msg_01', 'toolu_mon_0', 'Monitor', { shell: 'every 1s' }),
+        ccTaskStarted('task_a', 'toolu_mon_0'),
+        ccToolResult('toolu_mon_0', 'Monitor started'),
+        // Natural confirmation turn — parents off the spine.
+        ccMessageStart('msg_02'),
+        ccText('msg_02', 'Monitor started.'),
+        // Monitor pushed stdout → signal callback, parents off the tool row.
+        ccMessageStart('msg_03'),
+        ccText('msg_03', 'tick 1'),
+        ccResult(),
+      ]);
+
+      const toolCreate = mockCreateMessage.mock.calls.find(([p]: any) => p.role === 'tool');
+      const signalCreate = mockCreateMessage.mock.calls.find(
+        ([p]: any) => p.role === 'assistant' && p.metadata?.signal,
+      );
+      expect(toolCreate).toBeDefined();
+      expect(signalCreate).toBeDefined();
+      expect(signalCreate![0].parentId).toBe(toolCreate![0].id);
+
+      // Both rows must exist once the run settles, or the signal turn is lost.
+      expect(persisted.has(toolCreate![0].id)).toBe(true);
+      expect(persisted.has(signalCreate![0].id)).toBe(true);
+    });
+
     it('does NOT stamp metadata.signal on turns following a tool_result (main-chain follow-up)', async () => {
       const idCounter = { tool: 0, assistant: 0 };
       mockCreateMessage.mockImplementation(async (params: any) => {
@@ -4237,56 +4665,80 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
   });
 
   // ────────────────────────────────────────────────────
-  // Parallel main tool batch: tool_end must not race ahead of persistQueue
+  // Parallel main tool batch: frontend raw state is SoT before tool_end
   // ────────────────────────────────────────────────────
 
   describe('parallel-tools rollback regression', () => {
+    it('forwards initial stream_start with the existing assistant id so the handler skips DB refresh', async () => {
+      await runWithEvents([ccInit(), ccResult()]);
+
+      const handlerSpy = vi.mocked(createGatewayEventHandler).mock.results.at(-1)
+        ?.value as ReturnType<typeof vi.fn>;
+      const initialStreamStart = handlerSpy.mock.calls
+        .map(([event]: any[]) => event)
+        .find((event: any) => event?.type === 'stream_start' && !event.data?.newStep);
+
+      expect(initialStreamStart?.data?.assistantMessage).toMatchObject({
+        agentId: 'agent-1',
+        id: 'ast-initial',
+        role: 'assistant',
+        topicId: 'topic-1',
+      });
+    });
+
+    it('forwards terminal runtime_end with frontend uiMessages so the handler skips DB refresh', async () => {
+      const frontendMessages = [
+        {
+          agentId: 'agent-1',
+          content: 'test prompt',
+          id: 'user-1',
+          role: 'user',
+          topicId: 'topic-1',
+        },
+        {
+          agentId: 'agent-1',
+          content: 'done',
+          id: 'ast-initial',
+          role: 'assistant',
+          topicId: 'topic-1',
+        },
+      ];
+      const store = createMockStore({
+        dbMessagesMap: { 'main_agent-1_topic-1': frontendMessages },
+        messagesMap: { 'main_agent-1_topic-1': frontendMessages },
+      });
+
+      await runWithEvents([ccInit(), ccText('msg_01', 'done'), ccResult()], { store });
+
+      const handlerSpy = vi.mocked(createGatewayEventHandler).mock.results.at(-1)
+        ?.value as ReturnType<typeof vi.fn>;
+      const terminalRuntimeEnd = handlerSpy.mock.calls
+        .map(([event]: any[]) => event)
+        .find((event: any) => event?.type === 'agent_runtime_end');
+
+      expect(terminalRuntimeEnd?.data?.uiMessages).toEqual(frontendMessages);
+    });
+
     /**
      * User-reported bug: when CC fires a large parallel tool batch (e.g. 7
      * Bash commands at once), the AssistantGroup tool count occasionally
      * "rolls back" — e.g. UI shows "7 次技能调用" then drops to 6.
      *
-     * Root cause: the executor's `persistQueue` (DB writes) and the gateway
-     * handler's `processingChain` (in-memory dispatch + fetchAndReplaceMessages
-     * on tool_end) are two independent serial queues with no happens-before
-     * between them. `tool_end` events are forwarded to the handler
-     * SYNCHRONOUSLY at the bottom of `handleStreamEvent` (the
-     * `pendingStepTransition` gate only fires on stream_start(newStep), not
-     * inside a single message.id with parallel tool_use). So when a fast
-     * tool_result lands before persistQueue has flushed the LAST
-     * persistToolBatch's Phase 1/3 write, the handler runs
-     * fetchAndReplaceMessages → reads `assistant.tools` with a partial array
-     * → replaceMessages clobbers in-memory state from N → N-k.
-     *
-     * Observable invariant: by the time the handler is invoked with the FIRST
-     * `tool_end` event (which is what triggers fetchAndReplaceMessages), the
-     * most recent `mockUpdateMessage` call that wrote a `tools` array must
-     * already carry the full cumulative tool list. Otherwise, in real life,
-     * the DB read at that moment would return a shorter array and the UI
-     * would visibly drop tools.
-     *
-     * The test slows down `mockUpdateMessage` whenever `val.tools` is present,
-     * simulating the lag between Phase 1/3 writes and the rest of the stream.
-     * `vi.fn().mock.invocationCallOrder` gives a total ordering across all
-     * mocks so we can compare "when was the Nth tools-write CALLED" against
-     * "when was the first tool_end forwarded to the handler".
+     * New invariant: the executor treats the renderer's raw message bucket as
+     * the streaming SoT. Before forwarding the first `tool_end`, it must have
+     * locally created all tool rows and updated the parent assistant's `tools[]`
+     * with pre-allocated `result_msg_id`s. The forwarded event is marked so the
+     * gateway handler skips its historical DB refetch; write-behind batchMutate
+     * can drain independently without clobbering the frontend snapshot.
      */
-    it('handler must not receive tool_end before persistQueue flushes full tools[]', async () => {
-      // Slow tools-bearing updateMessage writes — mirrors a real PG/lambda
-      // round trip taking long enough that a fast Bash tool_result can land
-      // before all 7 persistToolBatch operations finish their Phase 1/3.
+    it('handler receives tool_end only after local raw SoT has full tools[]', async () => {
+      // Slow DB writes to prove local SoT, not backend timing, is the ordering
+      // source. tool_end should no longer depend on these writes completing.
       const TOOLS_WRITE_DELAY_MS = 12;
       mockUpdateMessage.mockImplementation(async (_id: string, val: any) => {
         if (val?.tools) {
           await new Promise((r) => setTimeout(r, TOOLS_WRITE_DELAY_MS));
         }
-      });
-
-      // Give each tool message a deterministic id so we can spot-check.
-      let toolIdx = 0;
-      mockCreateMessage.mockImplementation(async (params: any) => {
-        if (params.role === 'tool') return { id: `tool-msg-${++toolIdx}` };
-        return { id: `ast-${params.role}-${Date.now()}` };
       });
 
       const PARALLEL = 7;
@@ -4305,59 +4757,111 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       }
       events.push(ccResult());
 
-      await runWithEvents(events);
+      const { store } = await runWithEvents(events);
 
       const handlerSpy = vi.mocked(createGatewayEventHandler).mock.results[0]?.value as ReturnType<
         typeof vi.fn
       >;
       expect(handlerSpy).toBeDefined();
 
-      // Find the FIRST tool_end forwarded to the handler — this is the call
-      // that would trigger `fetchAndReplaceMessages` in real life and read
-      // assistant.tools[] from DB.
+      // Find the FIRST tool_end forwarded to the handler. Historically this
+      // would trigger `fetchAndReplaceMessages`; it now carries a skip marker
+      // after local raw SoT has settled.
       const handlerCalls = handlerSpy.mock.calls.map((args, i) => ({
         event: args[0] as any,
         order: handlerSpy.mock.invocationCallOrder[i],
       }));
       const firstToolEnd = handlerCalls.find(({ event }) => event?.type === 'tool_end');
       expect(firstToolEnd).toBeDefined();
+      expect(firstToolEnd!.event.data?.skipMessageFetch).toBe(true);
 
-      // All `mockUpdateMessage(_, { tools })` calls — these are persistToolBatch
-      // Phase 1 (pre-register) and Phase 3 (backfill) writes. Their invocation
-      // order is the moment Phase 1/3 ENTERED `await messageService.updateMessage`.
-      // Because persistToolBatch awaits each phase before moving on, the order
-      // here is a faithful proxy for the DB-write timeline.
-      const toolsWrites = mockUpdateMessage.mock.calls
-        .map((args, i) => ({
-          tools: (args[1] as any)?.tools,
-          order: mockUpdateMessage.mock.invocationCallOrder[i],
+      // Local raw-bucket assistant tools[] updates. This is the frontend SoT the
+      // UI reads while write-behind persistence is still draining.
+      const localToolsWrites = store.internal_dispatchMessage.mock.calls
+        .map((args: any[], i: number) => ({
+          payload: args[0] as any,
+          order: store.internal_dispatchMessage.mock.invocationCallOrder[i],
         }))
-        .filter(({ tools }) => Array.isArray(tools));
+        .filter(
+          ({ payload }: { payload: any }) =>
+            payload.type === 'updateMessage' && Array.isArray(payload.value?.tools),
+        );
 
       // The latest tools[] write that started BEFORE the handler's first tool_end.
-      // If the executor properly defers tool_end through persistQueue, this
-      // should be the FINAL Phase 3 write carrying all 7 tools.
-      const latestBeforeToolEnd = toolsWrites.findLast(({ order }) => order < firstToolEnd!.order);
+      // With frontend SoT this must be the final local update carrying all 7
+      // tools, regardless of whether DB updateMessage has completed.
+      const latestBeforeToolEnd = localToolsWrites.findLast(
+        ({ order }: { order: number }) => order < firstToolEnd!.order,
+      );
 
-      // The bug: without the deferral fix, persistQueue is still mid-flight
-      // (or hasn't started) when tool_end is forwarded, so the latest tools[]
-      // write seen at that point has fewer than PARALLEL entries — exactly
-      // the "7 → 6" rollback the user sees in the UI.
-      const writtenCount = latestBeforeToolEnd?.tools?.length ?? 0;
-      const writtenIds = (latestBeforeToolEnd?.tools ?? []).map((t: any) => t.id);
+      const writtenTools = latestBeforeToolEnd?.payload.value.tools ?? [];
+      const writtenCount = writtenTools.length;
+      const writtenIds = writtenTools.map((t: any) => t.id);
       const handlerEventTrail = handlerCalls.map(({ event }) => event?.type).join(',');
       expect(
         writtenCount,
         `tool_end forwarded to handler at order ${firstToolEnd!.order} ` +
-          `but the latest persistToolBatch tools[] write at that point had ` +
-          `${writtenCount}/${PARALLEL} tools — fetchAndReplaceMessages would ` +
-          `read partial assistant.tools[] and roll back the UI. ` +
+          `but the latest local tools[] write at that point had ` +
+          `${writtenCount}/${PARALLEL} tools. ` +
           `Handler event trail: [${handlerEventTrail}]`,
       ).toBe(PARALLEL);
       // All 7 tool ids must be present in that write — guards against any
       // weird ordering where the last write happens to have 7 entries but
       // the wrong ones (e.g. dedupe bug repopulating from a stale set).
       for (const id of toolIds) expect(writtenIds).toContain(id);
+      for (const tool of writtenTools) expect(tool.result_msg_id).toMatch(/^msg_/);
+    });
+
+    it('creates main tool rows and resolves tool results in the local raw bucket', async () => {
+      const toolIds = ['toolu_sot_1', 'toolu_sot_2', 'toolu_sot_3'];
+      const events: any[] = [ccInit()];
+      for (const id of toolIds) {
+        events.push(ccToolUse('msg_sot', id, 'Bash', { command: `echo ${id}` }));
+      }
+      for (const id of toolIds) {
+        events.push(ccToolResult(id, `result of ${id}`));
+      }
+      events.push(ccResult());
+
+      const { store } = await runWithEvents(events);
+      const dispatches = store.internal_dispatchMessage.mock.calls.map(
+        ([payload]: any[]) => payload,
+      );
+      const localToolCreates = dispatches.filter(
+        (payload: any) => payload.type === 'createMessage' && payload.value?.role === 'tool',
+      );
+
+      expect(localToolCreates).toHaveLength(toolIds.length);
+
+      const messageIdByToolCallId = new Map<string, string>();
+      for (const payload of localToolCreates) {
+        messageIdByToolCallId.set(payload.value.tool_call_id, payload.value.id);
+        expect(payload.value).toMatchObject({
+          parentId: 'ast-initial',
+          role: 'tool',
+          topicId: 'topic-1',
+        });
+      }
+
+      const finalAssistantTools = dispatches.findLast(
+        (payload: any) =>
+          payload.type === 'updateMessage' &&
+          payload.id === 'ast-initial' &&
+          Array.isArray(payload.value?.tools),
+      ).value.tools;
+
+      for (const id of toolIds) {
+        const tool = finalAssistantTools.find((item: any) => item.id === id);
+        expect(tool?.result_msg_id).toBe(messageIdByToolCallId.get(id));
+        expect(
+          dispatches.some(
+            (payload: any) =>
+              payload.type === 'updateMessage' &&
+              payload.id === messageIdByToolCallId.get(id) &&
+              payload.value?.content === `result of ${id}`,
+          ),
+        ).toBe(true);
+      }
     });
   });
 
