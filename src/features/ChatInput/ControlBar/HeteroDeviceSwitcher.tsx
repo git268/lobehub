@@ -1,39 +1,44 @@
 'use client';
 
-import { SiApple, SiLinux } from '@icons-pack/react-simple-icons';
 import { isDesktop } from '@lobechat/const';
-import { isRemoteHeterogeneousType } from '@lobechat/heterogeneous-agents';
+import {
+  HETEROGENEOUS_TYPE_LABELS,
+  isRemoteHeterogeneousType,
+} from '@lobechat/heterogeneous-agents';
 import type { DeviceExecutionTarget } from '@lobechat/types';
-import { resolveAgencyConfig } from '@lobechat/types';
-import { Microsoft } from '@lobehub/icons';
 import { Flexbox, Icon, Popover, Tooltip } from '@lobehub/ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import {
-  BoxIcon,
   CheckIcon,
   ChevronDownIcon,
   ExternalLinkIcon,
   InfoIcon,
-  LaptopIcon,
   MonitorDownIcon,
-  MonitorIcon,
-  MonitorOffIcon,
   SettingsIcon,
-  SparklesIcon,
 } from 'lucide-react';
 import { memo, type ReactNode, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { DOWNLOAD_URL } from '@/const/url';
+import { useChatInputResourceAccess } from '@/features/ChatInput/hooks/useChatInputResourceAccess';
 import { useSelectExecutionTarget } from '@/features/ChatInput/hooks/useSelectExecutionTarget';
+import { useDeviceList } from '@/features/DeviceManager/useDeviceList';
+import {
+  ExecutionTargetDeviceStatus,
+  ExecutionTargetIcon,
+  groupExecutionTargetDevices,
+} from '@/features/ExecutionTargetPicker';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
-import { resolveExecutionTarget } from '@/helpers/executionTarget';
+import {
+  isHeterogeneousSandboxExecutionAvailable,
+  resolveExecutionTarget,
+} from '@/helpers/executionTarget';
 import { useIsGatewayModeEnabled } from '@/helpers/gatewayMode';
-import { lambdaQuery } from '@/libs/trpc/client';
+import { useEffectiveAgencyConfig } from '@/hooks/useEffectiveAgencyConfig';
 import { useAgentStore } from '@/store/agent';
-import { agentByIdSelectors } from '@/store/agent/selectors';
 import { useElectronStore } from '@/store/electron';
-import { useUserStore } from '@/store/user';
-import { workspaceUserSettingsSelectors } from '@/store/user/selectors';
+
+import { formatFixedExecutionTargetTooltip } from './executionTargetTooltip';
 
 const styles = createStaticStyles(({ css }) => ({
   button: css`
@@ -59,6 +64,15 @@ const styles = createStaticStyles(({ css }) => ({
       background: ${cssVar.colorFillSecondary};
     }
   `,
+  buttonDisabled: css`
+    cursor: not-allowed;
+    opacity: 0.5;
+
+    &:hover {
+      color: ${cssVar.colorTextSecondary};
+      background: transparent;
+    }
+  `,
   buttonLabel: css`
     overflow: hidden;
     max-width: 120px;
@@ -77,25 +91,6 @@ const styles = createStaticStyles(({ css }) => ({
 
     font-size: 11px;
     color: ${cssVar.colorTextDescription};
-  `,
-  dotOffline: css`
-    flex: none;
-
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-
-    background: ${cssVar.colorTextQuaternary};
-  `,
-  dotOnline: css`
-    flex: none;
-
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-
-    background: ${cssVar.colorSuccess};
-    box-shadow: 0 0 0 2px ${cssVar.colorSuccessBg};
   `,
   deviceList: css`
     overflow-y: auto;
@@ -319,23 +314,6 @@ const OptionRow = memo<OptionRowProps>(({ active, desc, disabled, icon, label, o
 
 OptionRow.displayName = 'HeteroDeviceSwitcher.OptionRow';
 
-const getDeviceIcon = (platform: string | null | undefined, size = 14): ReactNode => {
-  switch (platform) {
-    case 'darwin': {
-      return <SiApple color="currentColor" size={size} />;
-    }
-    case 'linux': {
-      return <SiLinux color="currentColor" size={size} />;
-    }
-    case 'win32': {
-      return <Microsoft color="currentColor" size={size} />;
-    }
-    default: {
-      return <Icon icon={MonitorIcon} size={size} />;
-    }
-  }
-};
-
 interface HeteroDeviceSwitcherProps {
   agentId: string;
 }
@@ -344,36 +322,38 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   const { t } = useTranslation('chat');
   const [open, setOpen] = useState(false);
   const navigate = useWorkspaceAwareNavigate();
+  const { canUseResource, isGroupContext } = useChatInputResourceAccess();
+  const viewOnly = !canUseResource;
 
-  const sharedAgencyConfig = useAgentStore(agentByIdSelectors.getAgencyConfigById(agentId));
   const agentWorkspaceId = useAgentStore((s) => s.agentMap[agentId]?.workspaceId);
   const isWorkspaceAgent = Boolean(agentWorkspaceId);
 
-  // The current caller's per-agent override (LOBE-11689). Only ever non-empty
-  // for workspace agents in practice — personal agents already have a single
-  // owner whose choice is the shared config. Comes from the
-  // `workspaceUserSettings` slice (backed by `workspace_user_settings.preference`),
-  // which the picker eagerly fetches on mount so what the picker shows and
-  // what dispatch will actually do always agree. Merged over the shared config
-  // via `resolveAgencyConfig`.
-  const { isLoading: isWorkspacePreferenceLoading } = useUserStore(
-    (s) => s.useFetchWorkspaceUserPreference,
-  )();
-  const override = useUserStore(workspaceUserSettingsSelectors.agentDeviceOverrideById(agentId));
-  const agencyConfig = resolveAgencyConfig(sharedAgencyConfig, override);
+  // Shared config merged with the caller's per-agent override (LOBE-11689) —
+  // the hook eagerly fetches the `workspaceUserSettings` bucket on mount so
+  // what the picker shows and what dispatch will actually do always agree.
+  const {
+    agencyConfig,
+    isPreferenceLoading: isWorkspacePreferenceLoading,
+    workspaceScoped,
+  } = useEffectiveAgencyConfig(agentId);
+
+  const isFixedExecutionTarget =
+    isWorkspaceAgent && agencyConfig?.executionTargetSelectionPolicy === 'fixed';
 
   const heteroType = agencyConfig?.heterogeneousProvider?.type;
   const boundDeviceId = agencyConfig?.boundDeviceId;
 
-  // Heterogeneous agents (Claude Code / Codex — remote types already early-return
+  // Local heterogeneous agents (remote types already early-return
   // below) bring their own toolchain and must execute somewhere, so `'none'`
   // (plain chat, no execution environment) isn't a valid target for them: hide
   // the option and never fall back to / honour a stale stored `'none'`.
   const isHetero = !!heteroType;
+  const supportsSandbox = isHeterogeneousSandboxExecutionAvailable(heteroType);
 
-  const { data: devices, isLoading } = lambdaQuery.device.listDevices.useQuery(undefined, {
-    staleTime: 30_000,
-  });
+  // Workspace-keyed SWR fetch — the raw lambdaQuery key has no workspace
+  // dimension, so the picker kept showing the previous workspace's pool after
+  // a switch (LOBE-11904).
+  const { data: devices, isLoading } = useDeviceList();
 
   // The current machine's own gateway deviceId (desktop only), used to badge the
   // matching device row with a "This device" tag and show the local-process
@@ -382,20 +362,26 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   const gatewayDeviceInfo = useElectronStore((s) => s.gatewayDeviceInfo);
   const currentDeviceId = isDesktop ? gatewayDeviceInfo?.deviceId : undefined;
 
-  // Effective target: `resolveExecutionTarget` runs over the *merged*
-  // `agencyConfig` (shared + this user's LOBE-11689 override), so what the
-  // chip shows and what the server dispatches always agree.
-  //
-  // `workspaceScoped: false`: with per-user overrides, workspace agents can
-  // resolve `local` again — the pre-11689 coercion was only there because
-  // sharing the choice across members made a personal-scope `local` pick
-  // dangerous.
+  // A member's explicit target override may resolve `local`; without one the
+  // raw shared fallback stays workspace-scoped so a legacy `local` value keeps
+  // routing to its bound workspace device rather than this member's desktop.
   const deviceRoutingAvailable = useIsGatewayModeEnabled(agentId);
   const executionTarget = resolveExecutionTarget(agencyConfig, {
     clientExecutionAvailable: isDesktop,
     deviceRoutingAvailable,
     isHetero,
+    workspaceScoped,
   });
+
+  // Device-only CLIs cannot fall back to the cloud sandbox. When a web/legacy
+  // config has no usable device target, open the picker once so `none` is an
+  // explicit setup prompt rather than a disabled-but-active sandbox row.
+  useEffect(() => {
+    if (supportsSandbox) return;
+    if (isWorkspacePreferenceLoading) return;
+    if (executionTarget !== 'none') return;
+    setOpen(true);
+  }, [executionTarget, isWorkspacePreferenceLoading, supportsSandbox]);
 
   const selectExecutionTarget = useSelectExecutionTarget(agentId);
   const handleSelect = useCallback(
@@ -421,6 +407,10 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   // default would clobber it.
   useEffect(() => {
     if (!isDesktop) return;
+    // View-only members must not write anything — not even the harmless
+    // per-user local-device default.
+    if (viewOnly) return;
+    if (isFixedExecutionTarget) return;
     if (isWorkspacePreferenceLoading) return;
     if (agencyConfig?.executionTarget !== undefined) return;
     if (agencyConfig?.boundDeviceId !== undefined) return;
@@ -432,6 +422,8 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
     agencyConfig?.boundDeviceId,
     currentDeviceId,
     isWorkspacePreferenceLoading,
+    isFixedExecutionTarget,
+    viewOnly,
   ]);
 
   // Don't render for remote hetero agents — they use RemoteAgentConfigCard in profile.
@@ -459,15 +451,10 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   //
   // Naming — Personal is reserved for the account-tier concept; workspace
   // groupings say Private/Workspace (私人/工作区) instead.
-  const privateDevices = isWorkspaceAgent
-    ? (devices ?? []).filter((d) => d.scope === 'workspace' && d.visibility === 'private')
-    : [];
-  const workspaceDevices = isWorkspaceAgent
-    ? (devices ?? []).filter((d) => d.scope === 'workspace' && d.visibility !== 'private')
-    : [];
-  const personalOnlyDevices = isWorkspaceAgent
-    ? []
-    : (devices ?? []).filter((d) => d.scope === 'personal');
+  const { personal, privateWorkspace, workspace } = groupExecutionTargetDevices(devices);
+  const privateDevices = isWorkspaceAgent ? privateWorkspace : [];
+  const workspaceDevices = isWorkspaceAgent ? workspace : [];
+  const personalOnlyDevices = isWorkspaceAgent ? [] : personal;
   // Workspace agents always render the Private / Workspace group split (even
   // when one side is empty — the labels tell the user which pool they're
   // looking at). Personal mode stays flat.
@@ -488,20 +475,20 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   const showWorkspaceEnrollHint = isWorkspaceAgent && hasNoDevices && !isLoading;
 
   // Compute chip
-  let chipIcon: ReactNode = <Icon icon={BoxIcon} size={14} />;
+  let chipIcon: ReactNode = <ExecutionTargetIcon target={'sandbox'} />;
   let chipLabel = t('heteroAgent.executionTarget.sandbox');
   if (executionTarget === 'none') {
-    chipIcon = <Icon icon={MonitorOffIcon} size={14} />;
+    chipIcon = <ExecutionTargetIcon target={'none'} />;
     chipLabel = t('heteroAgent.executionTarget.none');
   } else if (executionTarget === 'auto') {
-    chipIcon = <Icon icon={SparklesIcon} size={14} />;
+    chipIcon = <ExecutionTargetIcon target={'auto'} />;
     chipLabel = t('heteroAgent.executionTarget.auto');
   } else if (executionTarget === 'local') {
     // 本机始终使用通用的本地电脑图标，不区分具体平台
-    chipIcon = <Icon icon={LaptopIcon} size={14} />;
+    chipIcon = <ExecutionTargetIcon target={'local'} />;
     chipLabel = t('heteroAgent.executionTarget.local');
   } else if (executionTarget === 'device') {
-    chipIcon = getDeviceIcon(boundDevice?.platform);
+    chipIcon = <ExecutionTargetIcon devicePlatform={boundDevice?.platform} target={'device'} />;
     chipLabel =
       boundDevice?.friendlyName ??
       boundDevice?.hostname ??
@@ -514,14 +501,11 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   };
 
   const renderDeviceStatus = (d: NonNullable<typeof devices>[number]) => (
-    <>
-      <span className={d.online ? styles.dotOnline : styles.dotOffline} />
-      <span>
-        {d.online
-          ? t('heteroAgent.executionTarget.online')
-          : t('heteroAgent.executionTarget.offline')}
-      </span>
-    </>
+    <ExecutionTargetDeviceStatus
+      offlineLabel={t('heteroAgent.executionTarget.offline')}
+      online={d.online}
+      onlineLabel={t('heteroAgent.executionTarget.online')}
+    />
   );
 
   const renderDeviceRow = (d: NonNullable<typeof devices>[number]) => {
@@ -530,7 +514,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
       <OptionRow
         active={isActive('device', d.deviceId)}
         disabled={!d.online}
-        icon={getDeviceIcon(d.platform)}
+        icon={<ExecutionTargetIcon devicePlatform={d.platform} target={'device'} />}
         key={d.deviceId}
         label={d.friendlyName || d.hostname || d.deviceId}
         tag={isCurrentMachine ? t('heteroAgent.executionTarget.gateway') : undefined}
@@ -568,7 +552,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
         ) : (
           <a
             className={styles.headerLink}
-            href="https://lobehub.com/downloads"
+            href={DOWNLOAD_URL.default}
             rel="noreferrer"
             target="_blank"
           >
@@ -581,7 +565,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
         <OptionRow
           active={isActive('none')}
           desc={t('heteroAgent.executionTarget.noneDesc')}
-          icon={<Icon icon={MonitorOffIcon} size={14} />}
+          icon={<ExecutionTargetIcon target={'none'} />}
           label={t('heteroAgent.executionTarget.none')}
           onClick={() => void handleSelect('none')}
         />
@@ -590,7 +574,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
         <OptionRow
           active={isActive('auto')}
           desc={t('heteroAgent.executionTarget.autoDesc')}
-          icon={<Icon icon={SparklesIcon} size={14} />}
+          icon={<ExecutionTargetIcon target={'auto'} />}
           label={t('heteroAgent.executionTarget.auto')}
           onClick={() => void handleSelect('auto')}
         />
@@ -604,7 +588,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
         <OptionRow
           active={isActive('local')}
           desc={t('heteroAgent.executionTarget.localDesc')}
-          icon={<Icon icon={LaptopIcon} size={14} />}
+          icon={<ExecutionTargetIcon target={'local'} />}
           // 本机统一显示「本地设备」，不再带具体设备名称
           label={t('heteroAgent.executionTarget.local')}
           onClick={() => void handleSelect('local')}
@@ -612,9 +596,15 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
       ) : null}
       <OptionRow
         active={isActive('sandbox')}
-        desc={t('heteroAgent.executionTarget.sandboxDesc')}
-        icon={<Icon icon={BoxIcon} size={14} />}
+        disabled={!supportsSandbox}
+        icon={<ExecutionTargetIcon target={'sandbox'} />}
         label={t('heteroAgent.executionTarget.sandbox')}
+        desc={t(
+          supportsSandbox
+            ? 'heteroAgent.executionTarget.sandboxDesc'
+            : 'heteroAgent.executionTarget.sandboxUnsupported',
+          { name: heteroType ? HETEROGENEOUS_TYPE_LABELS[heteroType] : undefined },
+        )}
         onClick={() => void handleSelect('sandbox')}
       />
       {deviceRows.length > 0 ? (
@@ -661,7 +651,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
       {showWebDownloadCard ? (
         <a
           className={styles.downloadCard}
-          href="https://lobehub.com/downloads"
+          href={DOWNLOAD_URL.default}
           rel="noreferrer"
           target="_blank"
         >
@@ -685,6 +675,33 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
     </Flexbox>
   );
 
+  const selectionDisabled = viewOnly || isFixedExecutionTarget;
+  const chip = (
+    <div className={cx(styles.button, selectionDisabled && styles.buttonDisabled)}>
+      {chipIcon}
+      <span className={styles.buttonLabel}>{chipLabel}</span>
+      <Icon icon={ChevronDownIcon} size={12} />
+    </div>
+  );
+
+  // View-level General access: the whole input area is read-only, so the
+  // execution-target picker stays visible but inert (disabled, not hidden).
+  if (selectionDisabled)
+    return (
+      <Tooltip
+        title={
+          isFixedExecutionTarget
+            ? formatFixedExecutionTargetTooltip(
+                chipLabel,
+                t('heteroAgent.executionTarget.fixedTip'),
+              )
+            : t(isGroupContext ? 'input.viewOnlyGroup' : 'input.viewOnlyAgent')
+        }
+      >
+        {chip}
+      </Tooltip>
+    );
+
   return (
     <Popover
       content={content}
@@ -694,11 +711,7 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
       trigger="click"
       onOpenChange={setOpen}
     >
-      <div className={styles.button}>
-        {chipIcon}
-        <span className={styles.buttonLabel}>{chipLabel}</span>
-        <Icon icon={ChevronDownIcon} size={12} />
-      </div>
+      {chip}
     </Popover>
   );
 });

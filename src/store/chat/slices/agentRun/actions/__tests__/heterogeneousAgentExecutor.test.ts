@@ -51,10 +51,12 @@ vi.mock('@/services/message', () => ({
 
 // threadService — subagent Thread creation (CC `Task` tool_use)
 const mockCreateThread = vi.fn();
+const mockGetThreads = vi.fn();
 const mockUpdateThread = vi.fn();
 vi.mock('@/services/thread', () => ({
   threadService: {
     createThread: (...args: unknown[]) => mockCreateThread(...args),
+    getThreads: (...args: unknown[]) => mockGetThreads(...args),
     updateThread: (...args: unknown[]) => mockUpdateThread(...args),
   },
 }));
@@ -217,6 +219,7 @@ function createMockStore(overrides: Record<string, any> = {}) {
   const store = {
     associateMessageWithOperation: vi.fn(),
     completeOperation: vi.fn(),
+    dbMessagesMap: {},
     drainQueuedMessages: vi.fn(() => []),
     internal_dispatchMessage: vi.fn(),
     internal_toggleToolCallingStreaming: vi.fn(),
@@ -460,6 +463,23 @@ const codexCommandCompleted = (id: string, command: string, aggregatedOutput: st
   type: 'item.completed',
 });
 
+const codexTodo = (
+  lifecycle: 'item.completed' | 'item.started' | 'item.updated',
+  completed: number,
+) => ({
+  item: {
+    id: 'todo-1',
+    items: [
+      { completed: completed >= 1, text: 'Inspect' },
+      { completed: completed >= 2, text: 'Implement' },
+      { completed: completed >= 3, text: 'Verify' },
+    ],
+    status: lifecycle === 'item.completed' ? 'completed' : 'in_progress',
+    type: 'todo_list',
+  },
+  type: lifecycle,
+});
+
 const codexTurnCompleted = (usage?: {
   cached_input_tokens?: number;
   input_tokens?: number;
@@ -497,6 +517,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       agentSessionId: ipc.getAdapterSessionId(sessionId),
     }));
     mockGetMessages.mockResolvedValue([]);
+    mockGetThreads.mockResolvedValue([]);
     // Honor a caller-provided `id` like the real messageService does — the
     // main + subagent coordinators PRE-ALLOCATE message ids so their intents can
     // carry concrete parentId chains. A mock that minted its own id would break
@@ -562,7 +583,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
   });
 
   /**
-   * Runs the executor in background, then feeds CC events and completes.
+   * Runs the executor in background, then feeds raw events or inline emitters and completes.
    * Returns a promise that resolves when the executor finishes.
    */
   async function runWithEvents(
@@ -588,9 +609,10 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
     // Wait for startSession + subscribeBroadcasts to complete
     await flush();
 
-    // Feed CC events
+    // Feed raw adapter inputs or invoke an inline emitter for already-adapted events.
     for (const event of ccEvents) {
-      ipc.emitRawLine('ipc-sess-1', event);
+      if (typeof event === 'function') event();
+      else ipc.emitRawLine('ipc-sess-1', event);
     }
 
     // Signal completion
@@ -1632,7 +1654,16 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         imageList,
       });
 
-      expect(mockSendPrompt).toHaveBeenCalledWith('ipc-sess-1', 'test prompt', 'op-1', imageList);
+      expect(mockSendPrompt).toHaveBeenCalledWith({
+        agentId: 'agent-1',
+        imageList,
+        operationId: 'op-1',
+        prompt: 'test prompt',
+        sessionId: 'ipc-sess-1',
+        systemContext: undefined,
+        // Keys the run's in-app browser session (`topic:<topicId>`) in the main process.
+        topicId: 'topic-1',
+      });
     });
 
     it('should forward context selections as heterogeneous system context', async () => {
@@ -1654,15 +1685,18 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       });
 
       expect(mockSendPrompt).toHaveBeenCalledWith(
-        'ipc-sess-1',
-        'test prompt',
-        'op-1',
-        undefined,
-        expect.stringContaining('<user_context_selections count="1">'),
+        expect.objectContaining({
+          agentId: 'agent-1',
+          operationId: 'op-1',
+          prompt: 'test prompt',
+          sessionId: 'ipc-sess-1',
+          systemContext: expect.stringContaining('<user_context_selections count="1">'),
+        }),
       );
-      expect(mockSendPrompt.mock.calls[0][4]).toContain('filePath="src/example.ts"');
-      expect(mockSendPrompt.mock.calls[0][4]).toContain('lines="7-7"');
-      expect(mockSendPrompt.mock.calls[0][4]).toContain('const answer = 42;');
+      const { systemContext } = mockSendPrompt.mock.calls[0][0];
+      expect(systemContext).toContain('filePath="src/example.ts"');
+      expect(systemContext).toContain('lines="7-7"');
+      expect(systemContext).toContain('const answer = 42;');
     });
 
     it('should pass Claude Code model and thinking effort as spawn args', async () => {
@@ -1759,7 +1793,7 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         return { sessionId: sid };
       });
       mockSendPrompt.mockImplementation(
-        (sessionId: string) =>
+        ({ sessionId }: { sessionId: string }) =>
           new Promise<void>((resolve, reject) => {
             sendPromptControllers.set(sessionId, { reject, resolve });
           }),
@@ -2068,6 +2102,190 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
   });
 
   describe('Codex multi-turn persistence', () => {
+    it('optimistically replaces TodoProgress state while Codex is still running', async () => {
+      const { store } = await runWithEvents(
+        [
+          codexTurnStarted(),
+          codexTodo('item.started', 0),
+          codexTodo('item.updated', 1),
+          codexTodo('item.completed', 3),
+          codexTurnCompleted(),
+        ],
+        {
+          params: {
+            heterogeneousProvider: { command: 'codex', type: 'codex' as const },
+          },
+        },
+      );
+
+      const stateWrites = mockUpdateToolMessage.mock.calls
+        .map(([, value]) => value)
+        .filter((value) => value.heterogeneousToolState);
+      expect(stateWrites).toEqual([
+        expect.objectContaining({
+          heterogeneousToolState: { operationId: 'op-1', snapshotSeq: 1 },
+        }),
+        expect.objectContaining({
+          heterogeneousToolState: { operationId: 'op-1', snapshotSeq: 2 },
+        }),
+      ]);
+
+      const optimisticStates = store.internal_dispatchMessage.mock.calls
+        .map(([payload]: any[]) => payload)
+        .filter((payload: any) => payload.type === 'replaceMessagePluginState');
+      expect(optimisticStates).toHaveLength(2);
+      expect(optimisticStates.at(-1)).toMatchObject({
+        metadata: {
+          heterogeneousToolStateOperationId: 'op-1',
+          heterogeneousToolStateSeq: 2,
+        },
+        value: {
+          todos: {
+            items: [
+              { status: 'completed', text: 'Inspect' },
+              { status: 'processing', text: 'Implement' },
+              { status: 'todo', text: 'Verify' },
+            ],
+          },
+        },
+      });
+
+      const finalWrite = mockUpdateToolMessage.mock.calls
+        .map(([, value]) => value)
+        .find((value) => value.content === 'Todo list updated (3/3 completed).');
+      expect(finalWrite).toMatchObject({
+        pluginState: {
+          todos: {
+            items: [
+              { status: 'completed', text: 'Inspect' },
+              { status: 'completed', text: 'Implement' },
+              { status: 'completed', text: 'Verify' },
+            ],
+          },
+        },
+      });
+      expect(finalWrite).not.toHaveProperty('heterogeneousToolState');
+    });
+
+    it('does not replay failed intermediate tool state after the final result succeeds', async () => {
+      mockUpdateToolMessage.mockImplementation(async (_id, value) => ({
+        success: !value.heterogeneousToolState,
+      }));
+
+      await runWithEvents(
+        [
+          codexTurnStarted(),
+          codexTodo('item.started', 0),
+          codexTodo('item.updated', 1),
+          codexTodo('item.completed', 3),
+          codexTurnCompleted(),
+        ],
+        {
+          params: {
+            heterogeneousProvider: { command: 'codex', type: 'codex' as const },
+          },
+        },
+      );
+
+      const writes = mockUpdateToolMessage.mock.calls.map(([, value]) => value);
+      expect(writes.filter((value) => value.heterogeneousToolState)).toHaveLength(2);
+      expect(
+        writes.filter((value) => value.content === 'Todo list updated (3/3 completed).'),
+      ).toHaveLength(1);
+      expect(writes).toHaveLength(3);
+    });
+
+    it('drops main tool-state snapshots that arrive after the terminal result', async () => {
+      const latePluginState = {
+        todos: { items: [{ status: 'processing', text: 'Stale progress' }] },
+      };
+      const { store } = await runWithEvents(
+        [
+          codexTurnStarted(),
+          codexTodo('item.started', 0),
+          codexTodo('item.completed', 3),
+          () =>
+            ipc.emitStreamEvent('ipc-sess-1', {
+              data: {
+                chunkType: 'tool_state',
+                pluginState: latePluginState,
+                snapshotMode: 'replace',
+                snapshotSeq: 2,
+                toolCallId: 'todo-1',
+              },
+              type: 'stream_chunk',
+            }),
+          codexTurnCompleted(),
+        ],
+        {
+          params: {
+            heterogeneousProvider: { command: 'codex', type: 'codex' as const },
+          },
+        },
+      );
+
+      const writes = mockUpdateToolMessage.mock.calls.map(([, value]) => value);
+      expect(
+        writes.some(
+          (value) =>
+            value.heterogeneousToolState?.snapshotSeq === 2 &&
+            value.pluginState === latePluginState,
+        ),
+      ).toBe(false);
+      expect(writes.some((value) => value.content === 'Todo list updated (3/3 completed).')).toBe(
+        true,
+      );
+      expect(
+        store.internal_dispatchMessage.mock.calls.some(
+          ([payload]: any[]) =>
+            payload.type === 'replaceMessagePluginState' && payload.value === latePluginState,
+        ),
+      ).toBe(false);
+    });
+
+    it('accepts main tool state again after a new tool lifecycle starts', async () => {
+      const nextPluginState = {
+        todos: { items: [{ status: 'processing', text: 'New lifecycle' }] },
+      };
+      await runWithEvents(
+        [
+          codexTurnStarted(),
+          codexTodo('item.started', 0),
+          codexTodo('item.completed', 3),
+          () =>
+            ipc.emitStreamEvent('ipc-sess-1', {
+              data: { toolCallId: 'todo-1' },
+              type: 'tool_start',
+            }),
+          () =>
+            ipc.emitStreamEvent('ipc-sess-1', {
+              data: {
+                chunkType: 'tool_state',
+                pluginState: nextPluginState,
+                snapshotMode: 'replace',
+                snapshotSeq: 2,
+                toolCallId: 'todo-1',
+              },
+              type: 'stream_chunk',
+            }),
+          codexTurnCompleted(),
+        ],
+        {
+          params: {
+            heterogeneousProvider: { command: 'codex', type: 'codex' as const },
+          },
+        },
+      );
+
+      expect(
+        mockUpdateToolMessage.mock.calls.some(
+          ([, value]) =>
+            value.heterogeneousToolState?.snapshotSeq === 2 &&
+            value.pluginState === nextPluginState,
+        ),
+      ).toBe(true);
+    });
+
     it('should persist Codex host model metadata onto the current assistant message', async () => {
       await runWithEvents(
         [
@@ -3367,6 +3585,103 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
   // ────────────────────────────────────────────────────
 
   describe('CC subagent thread-container', () => {
+    it('drops subagent tool-state snapshots that arrive after the terminal result', async () => {
+      const latePluginState = { status: 'processing' };
+      const { store } = await runWithEvents([
+        ccInit(),
+        ccToolUse('msg_main', 'toolu_task', 'Task', {
+          description: 'Inspect files',
+          subagent_type: 'Explore',
+        }),
+        ccSubagentToolUse('msg_sub', 'toolu_task', 'toolu_child', 'Read'),
+        ccSubagentToolResult('toolu_child', 'toolu_task', 'file content'),
+        () =>
+          ipc.emitStreamEvent('ipc-sess-1', {
+            data: {
+              chunkType: 'tool_state',
+              pluginState: latePluginState,
+              snapshotMode: 'replace',
+              snapshotSeq: 1,
+              subagent: { parentToolCallId: 'toolu_task' },
+              toolCallId: 'toolu_child',
+            },
+            type: 'stream_chunk',
+          }),
+        ccSubagentSpawnResult('toolu_task', 'done'),
+        ccResult(),
+      ]);
+
+      expect(
+        mockUpdateToolMessage.mock.calls.some(
+          ([, value]) =>
+            value.heterogeneousToolState?.snapshotSeq === 1 &&
+            value.pluginState === latePluginState,
+        ),
+      ).toBe(false);
+      expect(
+        mockUpdateToolMessage.mock.calls.some(([, value]) => value.content === 'file content'),
+      ).toBe(true);
+      expect(
+        store.internal_dispatchMessage.mock.calls.some(
+          ([payload]: any[]) =>
+            payload.type === 'replaceMessagePluginState' && payload.value === latePluginState,
+        ),
+      ).toBe(false);
+    });
+
+    it('does not recreate a finalized subagent Thread after a client executor restart', async () => {
+      mockGetThreads.mockResolvedValue([
+        {
+          id: 'thread-existing',
+          metadata: { sourceToolCallId: 'toolu_task' },
+          status: ThreadStatus.Active,
+          type: 'isolation',
+        },
+      ]);
+
+      await runWithEvents([
+        ccInit(),
+        ccSubagentText('msg_sub', 'toolu_task', 'replayed late event'),
+        ccResult(),
+      ]);
+
+      expect(mockCreateThread).not.toHaveBeenCalled();
+    });
+
+    it('reattaches a continuing subagent to its existing Processing Thread', async () => {
+      mockGetThreads.mockResolvedValue([
+        {
+          id: 'thread-existing',
+          metadata: { sourceToolCallId: 'toolu_task' },
+          status: ThreadStatus.Processing,
+          type: 'isolation',
+        },
+      ]);
+      mockGetMessages.mockResolvedValue([
+        {
+          id: 'assistant-existing',
+          metadata: { subagentMessageId: 'msg_sub' },
+          role: 'assistant',
+          threadId: 'thread-existing',
+          topicId: 'topic-1',
+        },
+      ]);
+
+      await runWithEvents([
+        ccInit(),
+        ccSubagentText('msg_sub', 'toolu_task', 'continued event'),
+        ccSubagentSpawnResult('toolu_task', 'done'),
+        ccResult(),
+      ]);
+
+      expect(mockCreateThread).not.toHaveBeenCalled();
+      expect(mockUpdateMessage.mock.calls).toContainEqual([
+        'assistant-existing',
+        expect.objectContaining({ content: 'continued event' }),
+        undefined,
+      ]);
+    });
+
     it('does NOT create a Thread on Task tool_use alone (lazy creation)', async () => {
       // Task tool_use without any subagent events should NOT trigger
       // Thread creation — we only know the spawn is real once the
@@ -3462,6 +3777,43 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
       expect(subToolCreate![0].parentId).not.toBe('ast-initial');
       // The in-thread assistant + tool messages share the same threadId.
       expect(subAssistantMsg![0]).toMatchObject({ threadId });
+    });
+
+    it('preserves subagent tool ids when a later batch operation fails', async () => {
+      const defaultBatchMutate = mockBatchMutate.getMockImplementation()!;
+      mockBatchMutate.mockImplementation(async (operations: any[]) => {
+        const result = await defaultBatchMutate(operations);
+        const hasSubagentToolCreate = operations.some(
+          (operation) =>
+            operation.type === 'createMessage' && operation.message?.tool_call_id === 'toolu_child',
+        );
+        if (!hasSubagentToolCreate) return result;
+
+        const finalIndex = operations.length - 1;
+        return {
+          results: result.results.map((item: any) =>
+            item.index === finalIndex ? { ...item, success: false } : item,
+          ),
+          success: false,
+        };
+      });
+
+      await runWithEvents([
+        ccInit(),
+        ccToolUse('msg_main', 'toolu_task', 'Task', {
+          description: 'inspect',
+          subagent_type: 'Explore',
+        }),
+        ccSubagentToolUse('msg_sub_1', 'toolu_task', 'toolu_child', 'Bash', { command: 'ls' }),
+        ccToolResult('toolu_child', 'ls output'),
+        ccResult(),
+      ]);
+
+      expect(mockUpdateToolMessage.mock.calls).toContainEqual([
+        expect.any(String),
+        expect.objectContaining({ content: 'ls output' }),
+        undefined,
+      ]);
     });
 
     it('opens a NEW in-thread assistant when subagentMessageId changes (turn boundary)', async () => {
@@ -3629,7 +3981,14 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         ([id, val]: any) => id !== 'ast-initial' && val.content === 'Here is the summary.',
       );
       expect(threadAssistantContentWrites.length).toBeGreaterThan(0);
-      expect(threadAssistantContentWrites[0][2]).toMatchObject({ topicId: 'topic-1' });
+      expect(mockBatchMutate.mock.calls).toContainEqual([
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'updateMessage',
+            value: expect.objectContaining({ content: 'Here is the summary.' }),
+          }),
+        ]),
+      ]);
       // Sanity — the in-thread assistants exist under the right thread.
       const threadAssistants = mockCreateMessage.mock.calls.filter(
         ([p]: any) => p.role === 'assistant' && p.threadId === threadId,
@@ -3912,6 +4271,14 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
           payload.content === spawnResult,
       );
       expect(terminalCreate).toBeDefined();
+      expect(mockBatchMutate.mock.calls).toContainEqual([
+        expect.arrayContaining([
+          expect.objectContaining({
+            message: expect.objectContaining({ content: spawnResult, role: 'assistant', threadId }),
+            type: 'createMessage',
+          }),
+        ]),
+      ]);
 
       // Terminal message chains off the in-thread assistant (the subagent
       // spine), with the child tool inline, so the transcript flows
@@ -3921,6 +4288,15 @@ describe('heterogeneousAgentExecutor DB persistence', () => {
         ([payload]: any) => payload.role === 'tool' && payload.tool_call_id === 'toolu_child',
       );
       expect(toolCreate).toBeDefined();
+      expect(mockBatchMutate.mock.calls).toContainEqual([
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'updateMessage' }),
+          expect.objectContaining({
+            message: expect.objectContaining({ tool_call_id: 'toolu_child' }),
+            type: 'createMessage',
+          }),
+        ]),
+      ]);
       const firstAssistantCreate = mockCreateMessage.mock.calls.find(
         ([payload]: any) => payload.role === 'assistant' && payload.threadId === threadId,
       );

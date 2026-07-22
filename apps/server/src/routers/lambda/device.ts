@@ -6,7 +6,7 @@ import type {
   DeviceWorkspaceShare,
   WorkingDirEntry,
 } from '@lobechat/types';
-import { deriveWorktreePath } from '@lobechat/types';
+import { deriveWorktreePath, sortDevicesByActivity, workingDirConfigSchema } from '@lobechat/types';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
@@ -25,7 +25,6 @@ import { type DeviceAttachment, deviceGateway } from '@/server/services/deviceGa
 
 import { preserveWorkspaceCache } from './deviceWorkingDirs';
 import { assertWorkspaceDeviceVisible, assertWorkspaceRootApproved } from './deviceWorkspaceGuard';
-import { workingDirConfigSchema } from './workingDirSchema';
 
 // Derive the zod enum from the canonical config so new platforms are
 // automatically covered without touching this file.
@@ -55,6 +54,25 @@ const canEditWorkspaceDevice = (
   actorUserId: string,
   enrollerUserId: string,
 ): boolean => role === 'owner' || enrollerUserId === actorUserId;
+
+/**
+ * Fixed workspace agents promise every member the same execution device. Keep
+ * that promise intact until an editor changes the agent back to member choice
+ * (or binds a different public device) before hiding/removing this row.
+ */
+const assertDeviceNotBoundToFixedAgent = async (
+  model: DeviceModel,
+  deviceId: string,
+): Promise<void> => {
+  if (!(await model.hasFixedAgentBinding(deviceId))) return;
+
+  throw new TRPCError({
+    cause: { data: { code: 'DeviceBoundToFixedAgent' } },
+    code: 'PRECONDITION_FAILED',
+    message:
+      'This device is fixed to one or more workspace agents. Change those agent settings first.',
+  });
+};
 
 /**
  * Workspace-write gate: membership + at least `member` role (excludes viewer).
@@ -209,6 +227,29 @@ export const deviceRouter = router({
       });
       return result ?? null;
     }),
+
+  /** Query OpenCode's model catalog on the device that will execute the agent. */
+  listHeterogeneousAgentModels: deviceProcedure
+    .input(
+      z.object({
+        command: z.string().optional(),
+        cwd: z.string().optional(),
+        deviceId: z.string(),
+        env: z.record(z.string(), z.string()).optional(),
+        type: z.literal('opencode'),
+      }),
+    )
+    .query(async ({ ctx, input }) =>
+      deviceGateway.listHeterogeneousAgentModels({
+        command: input.command,
+        cwd: input.cwd,
+        deviceId: input.deviceId,
+        env: input.env,
+        type: input.type,
+        userId: ctx.userId,
+        workspaceId: ctx.workspaceId,
+      }),
+    ),
 
   /**
    * List the git worktrees attached to the same repository as a directory on a
@@ -870,10 +911,15 @@ export const deviceRouter = router({
       return [...fromDb, ...ghosts];
     };
 
-    return [
+    // Ordered here rather than in SQL: `online` is the primary key and only the
+    // gateway knows it, so no per-pool `ORDER BY` can produce it — the two pools
+    // and their ghosts have to be merged first, then ordered as one list.
+    // Consumers (settings list, picker) filter this down to a single scope, and
+    // filtering preserves order, so one pass serves every surface.
+    return sortDevicesByActivity([
       ...buildItems(personalRows, personalOnline, 'personal'),
       ...buildItems(workspaceRows, workspaceOnline, 'workspace', hiddenWorkspaceIds),
-    ];
+    ]);
   }),
 
   /**
@@ -1020,6 +1066,9 @@ export const deviceRouter = router({
             message: 'Only the enrolling member or a workspace owner can overwrite this device.',
           });
         }
+        if ((input.visibility ?? 'private') === 'private') {
+          await assertDeviceNotBoundToFixedAgent(model, existing.deviceId);
+        }
       }
 
       // Real enrollment — only after the caller is committed (no pending
@@ -1095,10 +1144,11 @@ export const deviceRouter = router({
    * Publish a private workspace device to the shared pool, or pull a public one
    * back to private. Mirrors the agent/file `setVisibility` contract:
    *   - the enrolling member may toggle their own device both ways;
-   *   - a workspace owner may demote any *visible* (public) device — other
-   *     members' private devices are invisible to owners by design (the lookup
-   *     below already fails closed with NOT_FOUND), so publishing someone
-   *     else's private device is impossible.
+   *   - nobody else may touch visibility (LOBE-11760): owners demoting another
+   *     member's public device would appropriate it into that member's private
+   *     list, and other members' private devices are invisible to everyone
+   *     else by design (the lookup below already fails closed with NOT_FOUND),
+   *     so the whole toggle is effectively enroller-only.
    */
   setWorkspaceDeviceVisibility: wsWritableProcedure
     .use(serverDatabase)
@@ -1115,13 +1165,14 @@ export const deviceRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Workspace device not found.' });
       }
       if (row.visibility === input.visibility) return { success: true };
-      const role = (ctx as { workspaceRole?: WorkspaceRole }).workspaceRole;
-      if (!canEditWorkspaceDevice(role, ctx.userId, row.userId)) {
+      if (row.userId !== ctx.userId) {
         throw new TRPCError({
           code: 'FORBIDDEN',
-          message:
-            'Only the enrolling member or a workspace owner can change this device visibility.',
+          message: 'Only the enrolling member can change this device visibility.',
         });
+      }
+      if (input.visibility === 'private') {
+        await assertDeviceNotBoundToFixedAgent(model, input.deviceId);
       }
       await model.setWorkspaceDeviceVisibility(input.deviceId, input.visibility);
       return { success: true };
@@ -1185,6 +1236,7 @@ export const deviceRouter = router({
           message: 'Only the enrolling member or a workspace owner can remove this device.',
         });
       }
+      await assertDeviceNotBoundToFixedAgent(model, input.deviceId);
       // Tell a live device to drop its workspace connection and stop
       // auto-reconnecting, so removal doesn't leave an online ghost. For most
       // rows this stays best-effort — an offline device simply stops resolving.

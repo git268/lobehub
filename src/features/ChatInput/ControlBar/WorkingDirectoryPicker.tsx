@@ -3,7 +3,6 @@
 import { isDesktop } from '@lobechat/const';
 import type { WorkingDirEntry } from '@lobechat/types';
 import { getWorkingDirSourcePath } from '@lobechat/types';
-import { isRecord } from '@lobechat/utils';
 import { ActionIcon, Flexbox, Icon, Input, Popover, Tooltip } from '@lobehub/ui';
 import { toast } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
@@ -29,10 +28,10 @@ import {
   getWorkingDirectoryName,
   getWorkingDirectoryPathString,
 } from '@/helpers/workingDirectoryPath';
+import { useEffectiveAgencyConfig } from '@/hooks/useEffectiveAgencyConfig';
 import { deviceService } from '@/services/device';
 import { electronSystemService } from '@/services/electron/system';
 import { useAgentStore } from '@/store/agent';
-import { agentByIdSelectors } from '@/store/agent/selectors';
 import { useChatStore } from '@/store/chat';
 import { topicSelectors } from '@/store/chat/selectors';
 import { deviceSelectors, useDeviceStore } from '@/store/device';
@@ -193,8 +192,8 @@ const styles = createStaticStyles(({ css }) => ({
   `,
 }));
 
-const isValidWorkingDirEntry = (entry: unknown): entry is WorkingDirEntry =>
-  isRecord(entry) && !!getWorkingDirectoryPathString(entry.path);
+const isValidWorkingDirEntry = (entry: WorkingDirEntry): boolean =>
+  !!getWorkingDirectoryPathString(entry.path);
 
 type FolderEntry = { path: string; repoType?: 'git' | 'github' };
 
@@ -296,9 +295,14 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
   // One-time fold of legacy localStorage recents into device.workingDirs.
   useMigrateDeviceRecents();
 
-  const agencyConfig = useAgentStore(agentByIdSelectors.getAgencyConfigById(agentId));
+  // Effective config (shared row + this member's device override, LOBE-11689)
+  // so recents / default cwd / the selected-repo label all resolve against the
+  // device THIS member's run actually targets.
+  const { agencyConfig, workspaceScoped } = useEffectiveAgencyConfig(agentId);
   const currentDeviceId = useElectronStore((s) => s.gatewayDeviceInfo?.deviceId);
-  const targetDeviceId = resolveTargetDeviceId(agencyConfig, currentDeviceId);
+  const targetDeviceId = resolveTargetDeviceId(agencyConfig, currentDeviceId, {
+    workspaceScoped,
+  });
   // The local machine's filesystem is browsable; a remote device's is not.
   const isLocalDevice = isDesktop && !!targetDeviceId && targetDeviceId === currentDeviceId;
 
@@ -328,6 +332,7 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
     legacyAgentWorkingDirectory,
     topicWorkingDirectory,
     topicWorkingDirectoryConfig,
+    workspaceScoped,
   });
   const selectedDir = getWorkingDirectoryPathString(resolvedSelectedDir);
 

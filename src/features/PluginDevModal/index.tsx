@@ -1,7 +1,8 @@
 import { isDesktop } from '@lobechat/const';
 import { TITLE_BAR_HEIGHT } from '@lobechat/desktop-bridge';
 import { type LobeToolCustomPlugin } from '@lobechat/types';
-import { Button, Drawer, Flexbox } from '@lobehub/ui';
+import { Drawer, Flexbox } from '@lobehub/ui';
+import { Button } from '@lobehub/ui/base-ui';
 import { App, Form, Popconfirm } from 'antd';
 import { useResponsive } from 'antd-style';
 import { memo, useEffect, useRef, useState } from 'react';
@@ -73,7 +74,15 @@ const DevModal = memo<DevModalProps>(
         onOpenChange(false);
       } catch (error) {
         console.error('[DevModal] Install failed:', error);
-        message.error(t('dev.saveError'));
+        const httpStatus = (error as { data?: { httpStatus?: number } })?.data?.httpStatus;
+        message.error(
+          httpStatus === 403
+            ? t(
+                'dev.permissionDenied',
+                'You are not allowed to modify this connector — only the creator or a workspace owner can',
+              )
+            : t('dev.saveError'),
+        );
       } finally {
         setSubmitting(false);
       }

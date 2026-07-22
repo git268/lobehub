@@ -31,6 +31,7 @@ import ImessageBridgeService from '@/services/imessageBridgeSrv';
 import { createLogger } from '@/utils/logger';
 import { setDesktopUserAgentHeader } from '@/utils/user-agent';
 
+import BrowserControlCtr from './BrowserControlCtr';
 import HeterogeneousAgentCtr from './HeterogeneousAgentCtr';
 import { ControllerModule, IpcMethod } from './index';
 import LocalFileCtr from './LocalFileCtr';
@@ -39,6 +40,11 @@ import RemoteServerConfigCtr from './RemoteServerConfigCtr';
 import ShellCommandCtr from './ShellCommandCtr';
 
 const logger = createLogger('controllers:GatewayConnectionCtr');
+
+// Mirror of `BrowserManifest.identifier` from `@lobechat/builtin-tool-browser`.
+// Hardcoded (not imported) so the desktop main process keeps zero builtin-tool
+// package deps — importing one risks the @lobechat/types stub runtime leak.
+const BrowserIdentifier = 'lobe-browser';
 
 /**
  * Inject the lh-notify protocol into the first turn of a new hetero-agent session.
@@ -201,7 +207,9 @@ export default class GatewayConnectionCtr extends ControllerModule {
     srv.setTokenRefresher(() => this.remoteServerConfigCtr.refreshAccessToken());
 
     // Wire up tool call handler
-    srv.setToolCallHandler((apiName, args) => this.executeToolCall(apiName, args));
+    srv.setToolCallHandler((identifier, apiName, args) =>
+      this.executeToolCall(identifier, apiName, args),
+    );
 
     // Wire up MCP call handler (tunneled stdio MCP calls from the cloud server)
     srv.setMcpCallHandler((mcpCall) => this.executeMcpCall(mcpCall));
@@ -315,10 +323,11 @@ export default class GatewayConnectionCtr extends ControllerModule {
       const accessToken = await this.remoteServerConfigCtr.getAccessToken();
       const jwt = accessToken || request.jwt;
 
-      // Fire-and-forget: lh hetero exec handles spawn -> adapt ->
-      // BatchIngester -> heteroIngest/heteroFinish -> server -> Gateway -> clients.
-      // Same command as spawnHeteroSandbox() on the server side.
-      this.heterogeneousAgentCtr.spawnLhHeteroExec({
+      // The embedded CLI handles spawn -> adapt -> BatchIngester ->
+      // heteroIngest/heteroFinish -> server -> Gateway -> clients. Wait until
+      // the process has actually spawned (or emitted an early error) before
+      // acknowledging the server request.
+      return await this.heterogeneousAgentCtr.spawnLhHeteroExec({
         agentType: request.agentType,
         args: request.args,
         cwd: request.cwd,
@@ -331,8 +340,6 @@ export default class GatewayConnectionCtr extends ControllerModule {
         systemContext: request.systemContext,
         topicId: request.topicId,
       });
-
-      return { status: 'accepted' };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return { reason, status: 'rejected' };
@@ -394,6 +401,7 @@ export default class GatewayConnectionCtr extends ControllerModule {
       enrollWorkspace: (params) => this.service.enrollWorkspace(params),
       getLocalFilePreview: (params) => this.localFileCtr.getLocalFilePreview(params),
       getProjectFileIndex: (params) => this.localFileCtr.getProjectFileIndex(params),
+      listHeterogeneousAgentModels: (params) => this.heterogeneousAgentCtr.listModels(params),
       searchProjectFiles: (params) => this.localFileCtr.searchProjectFiles(params),
       unenrollWorkspace: (params) => this.service.unenrollWorkspace(params),
       // Skill-archive cache (`prepareSkillDirectory` RPC): reuse LocalFileCtr's
@@ -412,9 +420,24 @@ export default class GatewayConnectionCtr extends ControllerModule {
   }
 
   private async executeToolCall(
+    identifier: string | undefined,
     apiName: string,
     args: unknown,
   ): Promise<BuiltinServerRuntimeOutput> {
+    // Browser is a renderer-resident tool: forward to the client executor via
+    // BrowserControlCtr instead of the local-system apiName switch below.
+    if (identifier === BrowserIdentifier) {
+      const result = await this.app
+        .getController(BrowserControlCtr)
+        .runGatewayToolCall(apiName, (args ?? {}) as Record<string, unknown>);
+      return {
+        content: result.content ?? '',
+        error: result.error,
+        state: result.state,
+        success: result.success,
+      };
+    }
+
     const runtime = this.getLocalSystemRuntime();
     const normalized = LEGACY_API_ALIASES[apiName] ?? apiName;
 

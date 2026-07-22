@@ -8,13 +8,13 @@ import { useAgentStore } from '@/store/agent';
 import { agentByIdSelectors } from '@/store/agent/selectors';
 
 import { useAgentId } from '../../hooks/useAgentId';
-import Action from '../components/Action';
+import { ChatInputAction } from '../components/ChatInputAction';
 import PopoverContent from './PopoverContent';
 import { useControls } from './useControls';
 
 const Tools = memo(() => {
   const { t } = useTranslation('setting');
-  const { marketItems, editPluginDrawer, pinnedCount, autoCount } = useControls();
+  const { marketItems, editPluginDrawer, pinnedCount, autoCount, isPolicyMenuOpen } = useControls();
 
   const agentId = useAgentId();
   const model = useAgentStore((s) => agentByIdSelectors.getAgentModelById(agentId)(s));
@@ -27,11 +27,13 @@ const Tools = memo(() => {
   }, []);
 
   if (!enableFC)
-    return <Action disabled icon={Blocks} showTooltip={true} title={t('tools.disabled')} />;
+    return (
+      <ChatInputAction disabled icon={Blocks} showTooltip={true} title={t('tools.disabled')} />
+    );
 
   return (
-    <Suspense fallback={<Action disabled icon={Blocks} title={t('tools.title')} />}>
-      <Action
+    <Suspense fallback={<ChatInputAction disabled icon={Blocks} title={t('tools.title')} />}>
+      <ChatInputAction
         icon={Blocks}
         showTooltip={false}
         title={t('tools.title')}
@@ -39,6 +41,7 @@ const Tools = memo(() => {
           content: (
             <PopoverContent
               autoCount={autoCount}
+              detailPopoverDisabled={isPolicyMenuOpen}
               items={marketItems}
               pinnedCount={pinnedCount}
               onOpenStore={handleOpenStore}

@@ -13,6 +13,7 @@ import {
   Clock,
   HandIcon,
   StarIcon,
+  TriangleAlert,
 } from 'lucide-react';
 
 export interface ExecutionStatusVisual {
@@ -22,8 +23,8 @@ export interface ExecutionStatusVisual {
 
 /**
  * Canonical glyph + color per execution-status semantic, shared by tasks and
- * topics (sidebar rows, group headers, kanban columns, management table, fleet
- * sidebar). One semantic → one visual, so the same state never renders with
+ * topics (sidebar rows, group headers, kanban columns, management table). One
+ * semantic → one visual, so the same state never renders with
  * different icons across surfaces. Live "running" rows may still swap the
  * static glyph for the animated `RingLoadingIcon` — same circle family and
  * warning color, animation just signals liveness.
@@ -59,9 +60,13 @@ export const TOPIC_STATUS_VISUALS: Record<ChatTopicStatus, ExecutionStatusVisual
   // Topic lists are mostly history: mute completed to keep long lists quiet,
   // unlike task boards where a green check marks an achievement.
   completed: { ...VISUALS.completed, color: cssVar.colorTextDescription },
-  failed: VISUALS.failed,
+  // A failed topic is an alert the user should act on, not a terminal outcome
+  // like a failed task run — the warning triangle reads that way, the circled X
+  // reads as "closed/rejected".
+  failed: { ...VISUALS.failed, icon: TriangleAlert },
   paused: VISUALS.paused,
   running: VISUALS.running,
+  scheduled: VISUALS.scheduled,
   // `unread` rows render a custom ripple dot; this is the fallback glyph.
   unread: { color: cssVar.colorInfo, icon: CircleDot },
   waitingForHuman: VISUALS.waitingForHuman,
