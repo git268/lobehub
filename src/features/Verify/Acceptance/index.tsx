@@ -78,6 +78,7 @@ import CheckList, {
   shouldGroupChecks,
   userReviewState,
 } from './CheckList';
+import { buildRepairPrompt, copyCheckRepairPrompt } from './checkWork';
 import DecisionBar from './DecisionBar';
 import { EMPTY_ID_SET, setAggregateEntry } from './expandState';
 import FeedbackDrawer, { type FeedbackListEntry } from './FeedbackDrawer';
@@ -88,25 +89,6 @@ import { acceptanceCheckPath, acceptanceOverviewPath } from './routes';
 import { getAcceptanceStatusActions } from './statusActions';
 import TopicPanel from './TopicPanel';
 import { canViewAcceptanceHistory, resolveAcceptanceHistoryNavigation } from './visibility';
-
-/**
- * The hardcoded repair prompt (复制 review 建议 / 打回重跑 share it): points the
- * agent at the CLI as the source of truth for this acceptance's feedback, so
- * nobody has to hand-summarize review notes into an instruction.
- */
-const buildRepairPrompt = (acceptanceId: string) =>
-  `Use the LobeHub CLI to read the latest review feedback for acceptance ${acceptanceId}:
-
-lh acceptance feedback ${acceptanceId} --actionable
-
-Every entry it prints (per-check comments, circled-region annotations on the evidence screenshots, and attachments) is the full set of feedback to handle this round. Fix the code item by item; then re-run verification and ingest the new result back into the SAME acceptance (reuse the existing check ids, and use supersedes for any check whose meaning changed). Keep the final report in the same language the previous rounds used.`;
-
-const buildCheckRepairPrompt = (
-  acceptanceId: string,
-  check: { id: string; seq: number; title: string },
-) => `${buildRepairPrompt(acceptanceId)}
-
-For this pass, focus on check C${check.seq} "${check.title}" (check id: ${check.id}). Treat it as the bounded work item: read its evidence and feedback, make the necessary change, and re-verify it without disturbing unrelated accepted or ignored checks.`;
 
 const styles = createStaticStyles(({ css }) => ({
   banner: css`
@@ -431,9 +413,13 @@ const AcceptancePage = memo<AcceptancePageProps>(
     }, [isNarrowViewport]);
     // A focused check is the review workspace: evidence gets the horizontal
     // room, while the round ledger remains available from the corner toggle.
-    useEffect(() => {
+    // Adjusted during render, not in an effect, so selecting a check commits in
+    // one render pass instead of render → effect → full second render.
+    const [prevFocusedCheckId, setPrevFocusedCheckId] = useState(focusedCheckId);
+    if (prevFocusedCheckId !== focusedCheckId) {
+      setPrevFocusedCheckId(focusedCheckId);
       if (focusedCheckId) setLedgerExpand(false);
-    }, [focusedCheckId]);
+    }
     const closeTopicPanel = useCallback(() => {
       setTopicPanelOpen(false);
       closeTopicDrawer();
@@ -466,7 +452,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
     }, [isEmbedded, data, urlRoundRaw]);
     const [pending, setPending] = useState(false);
     const [rerunPending, setRerunPending] = useState(false);
-    const [checkWorkPending, setCheckWorkPending] = useState(false);
     const [actionError, setActionError] = useState<string>();
     const [feedbackOpen, setFeedbackOpen] = useState(false);
 
@@ -553,6 +538,110 @@ const AcceptancePage = memo<AcceptancePageProps>(
       };
     }, [data]);
 
+    const acceptanceRecordId = data?.acceptance.id;
+    const runAction = useCallback(
+      async (action: () => Promise<unknown>) => {
+        try {
+          setPending(true);
+          setActionError(undefined);
+          await action();
+          await mutate();
+          // The list panel derives its glyph from the same status — a decision
+          // here must not leave a stale icon there until a hard refresh.
+          void globalMutate(verifyKeys.acceptances());
+          return true;
+        } catch (cause) {
+          setActionError(cause instanceof Error ? cause.message : t('acceptance.actionError'));
+          return false;
+        } finally {
+          setPending(false);
+        }
+      },
+      [mutate, t],
+    );
+
+    // Per-check user review — accept settles a check for good; reject records
+    // the feedback the next verify round reads.
+    const handleReview = useCallback(
+      async (input: CheckReviewInput) => {
+        if (!acceptanceRecordId) return false;
+        return runAction(() => verifyService.reviewChecks({ id: acceptanceRecordId, ...input }));
+      },
+      [runAction, acceptanceRecordId],
+    );
+
+    // Group-scoped feedback — for concerns that belong to no single check (the
+    // checks themselves may be accepted) yet must reach the next round.
+    const handleGroupFeedback = useCallback(
+      async (category: string, comment: string, fileIds: string[]) => {
+        if (!acceptanceRecordId) return false;
+        return runAction(() =>
+          verifyService.addGroupFeedback({
+            category,
+            comment,
+            fileIds: fileIds.length > 0 ? fileIds : undefined,
+            id: acceptanceRecordId,
+          }),
+        );
+      },
+      [runAction, acceptanceRecordId],
+    );
+
+    const gotoRound = useCallback((round: number) => {
+      setHighlightRound(round);
+      setLedgerExpand(true);
+    }, []);
+    const historyNavigation = useMemo(
+      () => resolveAcceptanceHistoryNavigation(Boolean(data?.isOwner), gotoRound),
+      [data?.isOwner, gotoRound],
+    );
+
+    const handleToggleGroup = useCallback(
+      (key: string) =>
+        setCollapsedGroups((previous) => {
+          const next = new Set(previous);
+          if (next.has(key)) next.delete(key);
+          else next.add(key);
+          return next;
+        }),
+      [setCollapsedGroups],
+    );
+    const handleToggleGroupItems = useCallback(
+      (ids: string[], open: boolean) =>
+        setExpanded((previous) => {
+          const next = new Set(previous);
+          for (const id of ids) {
+            if (open) next.add(id);
+            else next.delete(id);
+          }
+          return next;
+        }),
+      [setExpanded],
+    );
+    const handleToggleItem = useCallback(
+      (id: string) =>
+        setExpanded((previous) => {
+          const next = new Set(previous);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        }),
+      [setExpanded],
+    );
+
+    // Group-scoped feedback lives on each round's decision detail — flatten the
+    // chain into the derived per-entry view (roundIndex from the carrying run).
+    const groupFeedbackEntries = useMemo(
+      () =>
+        (data?.rounds ?? []).flatMap((round) =>
+          (round.run.decisionDetail?.groupFeedback ?? []).map((entry) => ({
+            ...entry,
+            roundIndex: round.run.roundIndex ?? 0,
+          })),
+        ),
+      [data],
+    );
+
     if (isLoading)
       return (
         <Center height={'100%'}>
@@ -611,14 +700,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
       );
     };
     const currentRound = rounds.at(-1);
-    // Group-scoped feedback lives on each round's decision detail — flatten the
-    // chain into the derived per-entry view (roundIndex from the carrying run).
-    const groupFeedbackEntries = rounds.flatMap((round) =>
-      (round.run.decisionDetail?.groupFeedback ?? []).map((entry) => ({
-        ...entry,
-        roundIndex: round.run.roundIndex ?? 0,
-      })),
-    );
     // The latest coding round's context — rendered with the latest report card
     // (it describes what THAT round verified), not as aggregate-level identity.
     // A round with no scenario predates the column and is a coding round; a
@@ -709,24 +790,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
                       label: t('acceptance.verdict.inProgress'),
                     };
 
-    const runAction = async (action: () => Promise<unknown>) => {
-      try {
-        setPending(true);
-        setActionError(undefined);
-        await action();
-        await mutate();
-        // The list panel derives its glyph from the same status — a decision
-        // here must not leave a stale icon there until a hard refresh.
-        void globalMutate(verifyKeys.acceptances());
-        return true;
-      } catch (cause) {
-        setActionError(cause instanceof Error ? cause.message : t('acceptance.actionError'));
-        return false;
-      } finally {
-        setPending(false);
-      }
-    };
-
     const changeAcceptanceStatus = async (status: 'accepted' | 'closed' | 'delivered') => {
       const succeeded = await runAction(() =>
         verifyService.updateAcceptanceStatus(acceptance.id, status),
@@ -765,12 +828,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
       },
     );
 
-    const gotoRound = (round: number) => {
-      setHighlightRound(round);
-      setLedgerExpand(true);
-    };
-    const historyNavigation = resolveAcceptanceHistoryNavigation(isOwner, gotoRound);
-
     // Open/close the round report drawer AND mirror it to `?r=` (standalone
     // page only) so the address bar is always a copyable snapshot link for the
     // round being viewed.
@@ -787,11 +844,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
         { replace: true },
       );
     };
-
-    // Per-check user review — accept settles a check for good; reject records
-    // the feedback the next verify round reads.
-    const handleReview = (input: CheckReviewInput) =>
-      runAction(() => verifyService.reviewChecks({ id: acceptance.id, ...input }));
 
     // The acceptance goal is a user-editable field — reuse the tray's goal
     // modal so both entry points write the same subject-level requirement. A
@@ -810,18 +862,6 @@ const AcceptancePage = memo<AcceptancePageProps>(
           await mutate();
         },
       });
-
-    // Group-scoped feedback — for concerns that belong to no single check (the
-    // checks themselves may be accepted) yet must reach the next round.
-    const handleGroupFeedback = (category: string, comment: string, fileIds: string[]) =>
-      runAction(() =>
-        verifyService.addGroupFeedback({
-          category,
-          comment,
-          fileIds: fileIds.length > 0 ? fileIds : undefined,
-          id: acceptance.id,
-        }),
-      );
 
     // The floating bar's one-line state + supporting line — the old banner's
     // content, relocated to where the decision actually happens.
@@ -1030,34 +1070,8 @@ const AcceptancePage = memo<AcceptancePageProps>(
 
     const handleCheckWork = async () => {
       if (!focusedCheck) return;
-      const prompt = buildCheckRepairPrompt(acceptance.id, focusedCheck);
-      if (isEmbedded) {
-        if (onDraftToComposer?.(prompt)) {
-          toast.success({ title: t('acceptance.checkWork.drafted') });
-        }
-        return;
-      }
-      if (!origin?.topic) {
-        await copyToClipboard(prompt);
-        toast.success({ title: t('acceptance.checkWork.copied') });
-        return;
-      }
-      setCheckWorkPending(true);
-      try {
-        await verifyService.dispatchAcceptanceRepair({
-          agentId: origin.agent?.id,
-          content: prompt,
-          topicId: origin.topic.id,
-        });
-        await verifyService.markAcceptanceRepairing(acceptance.id);
-        await mutate();
-        void globalMutate(verifyKeys.acceptances());
-        toast.success({ title: t('acceptance.checkWork.sent') });
-      } catch (cause) {
-        toast.error(cause instanceof Error ? cause.message : t('acceptance.actionError'));
-      } finally {
-        setCheckWorkPending(false);
-      }
+      await copyCheckRepairPrompt(acceptance.id, focusedCheck, copyToClipboard);
+      toast.success({ title: t('acceptance.checkWork.copied') });
     };
 
     const saveStandingChecklist = async (checklist: AcceptanceChecklistItem[]) => {
@@ -1622,14 +1636,8 @@ const AcceptancePage = memo<AcceptancePageProps>(
                               {t('acceptance.checkWork.description')}
                             </Text>
                           </Flexbox>
-                          <Button
-                            loading={checkWorkPending}
-                            type={'primary'}
-                            onClick={handleCheckWork}
-                          >
-                            {origin?.topic || isEmbedded
-                              ? t('acceptance.checkWork.action')
-                              : t('acceptance.checkWork.copy')}
+                          <Button type={'primary'} onClick={handleCheckWork}>
+                            {t('acceptance.checkWork.copy')}
                           </Button>
                         </Flexbox>
                       )}
@@ -1782,32 +1790,9 @@ const AcceptancePage = memo<AcceptancePageProps>(
                   onGroupFeedback={handleGroupFeedback}
                   onReview={handleReview}
                   onRound={historyNavigation}
-                  onToggleGroup={(key) =>
-                    setCollapsedGroups((previous) => {
-                      const next = new Set(previous);
-                      if (next.has(key)) next.delete(key);
-                      else next.add(key);
-                      return next;
-                    })
-                  }
-                  onToggleGroupItems={(ids, open) =>
-                    setExpanded((previous) => {
-                      const next = new Set(previous);
-                      for (const id of ids) {
-                        if (open) next.add(id);
-                        else next.delete(id);
-                      }
-                      return next;
-                    })
-                  }
-                  onToggleItem={(id) =>
-                    setExpanded((previous) => {
-                      const next = new Set(previous);
-                      if (next.has(id)) next.delete(id);
-                      else next.add(id);
-                      return next;
-                    })
-                  }
+                  onToggleGroup={handleToggleGroup}
+                  onToggleGroupItems={handleToggleGroupItems}
+                  onToggleItem={handleToggleItem}
                 />
               </>
             )}
