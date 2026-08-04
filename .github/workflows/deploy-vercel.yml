@@ -1,10 +1,17 @@
-name: Deploy to Vercel (Prebuilt)
+name: Sync upstream and deploy to Vercel
 
 on:
-  push:
-    branches:
-      - canary  # 如果你的主分支叫 master，这里要改成 master
-  workflow_dispatch: # 允许手动点击运行
+  schedule:
+   - cron: "0 0 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-deploy
+  cancel-in-progress: true
 
 env:
   VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
@@ -13,34 +20,83 @@ env:
 jobs:
   Deploy-to-Vercel:
     runs-on: ubuntu-latest
-    steps:
-      - name: 1. Checkout Code
-        uses: actions/checkout@v4
 
-      - name: 2. Setup Node.js
+    steps:
+      - name: 1. Checkout canary
+        uses: actions/checkout@v4
+        with:
+          ref: canary
+          fetch-depth: 0
+
+      - name: 2. Check upstream updates
+        id: upstream
+        run: |
+          git remote add upstream https://github.com/lobehub/lobehub.git
+          git fetch upstream canary
+
+          LOCAL_COMMIT=$(git rev-parse canary)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/canary)
+
+          echo "当前 Fork: $LOCAL_COMMIT"
+          echo "上游仓库: $UPSTREAM_COMMIT"
+
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有更新"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "上游有更新"
+          fi
+
+      - name: 3. Sync canary from upstream
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          git reset --hard upstream/canary
+          git push origin canary --force-with-lease
+
+      - name: 4. Setup Node.js
+        if: steps.upstream.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: 3. Setup Bun
+      - name: 5. Setup Bun
+        if: steps.upstream.outputs.changed == 'true'
         uses: oven-sh/setup-bun@v2
 
-      - name: 4. Setup PNPM
+      - name: 6. Setup PNPM
+        if: steps.upstream.outputs.changed == 'true'
         uses: pnpm/action-setup@v3
         with:
           version: latest
 
-      - name: 5. Install dependencies
-        run: pnpm install
+      - name: 7. Install dependencies
+        if: steps.upstream.outputs.changed == 'true'
+        run: pnpm install --frozen-lockfile
 
-      - name: 6. Install Vercel CLI
+      - name: 8. Install Vercel CLI
+        if: steps.upstream.outputs.changed == 'true'
         run: npm install --global vercel@latest
 
-      - name: 7. Pull Vercel Environment
-        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+      - name: 9. Pull Vercel Environment
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          vercel pull \
+            --yes \
+            --environment=production \
+            --token="${{ secrets.VERCEL_TOKEN }}"
 
-      - name: 8. Build Project Artifacts
-        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+      - name: 10. Build Project Artifacts
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          vercel build \
+            --prod \
+            --token="${{ secrets.VERCEL_TOKEN }}"
 
-      - name: 9. Deploy to Vercel
-        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+      - name: 11. Deploy to Vercel
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          vercel deploy \
+            --prebuilt \
+            --prod \
+            --token="${{ secrets.VERCEL_TOKEN }}"
