@@ -166,6 +166,14 @@ export const UserLabSchema = z.object({
    */
   enableClaudeCodeSdk: z.boolean().optional(),
   /**
+   * run Codex hetero sessions through codex app-server instead of one-shot CLI spawn
+   */
+  enableCodexAppServer: z.boolean().optional(),
+  /**
+   * enable displaying two desktop tabs side by side
+   */
+  enableDesktopSplitView: z.boolean().optional(),
+  /**
    * one-click import of local Claude Code / Codex CLI sessions as topics (desktop only)
    */
   enableHeteroSessionImport: z.boolean().optional(),
@@ -193,10 +201,6 @@ export const UserLabSchema = z.object({
    * show OAuth app management in personal and workspace settings
    */
   enableOAuthApps: z.boolean().optional(),
-  /**
-   * show the "Add Platform Agent" entry in the create menu
-   */
-  enablePlatformAgent: z.boolean().optional(),
   /**
    * enable the task delivery-acceptance (verify) config UI on the task detail
    */
