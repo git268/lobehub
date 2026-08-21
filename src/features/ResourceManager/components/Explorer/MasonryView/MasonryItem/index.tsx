@@ -3,7 +3,8 @@ import {
   CUSTOM_FOLDER_FILE_TYPE,
   MARKDOWN_MIME_TYPES,
 } from '@lobechat/const';
-import { Checkbox, stopPropagation } from '@lobehub/ui';
+import { stopPropagation } from '@lobehub/ui';
+import { Checkbox } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -391,6 +392,7 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
       filename: name,
       id,
       libraryId: knowledgeBaseId,
+      size,
       sourceType,
       url,
       userId,
@@ -476,6 +478,7 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
                     finishEmbedding={finishEmbedding}
                     id={chunkTargetId}
                     isInView={isInView}
+                    metadata={metadata}
                     name={name}
                     size={size}
                     url={url}

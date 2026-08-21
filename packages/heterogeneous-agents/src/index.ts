@@ -1,4 +1,19 @@
-export { AmpAdapter, ClaudeCodeAdapter, QoderAdapter } from './adapters';
+export {
+  AmpAdapter,
+  ClaudeCodeAdapter,
+  CodeBuddyAdapter,
+  GrokBuildAdapter,
+  QoderAdapter,
+} from './adapters';
+export {
+  buildClaudeCodeDirectEnv,
+  type BuildClaudeCodeDirectEnvInput,
+  type BuildClaudeCodeDirectEnvResult,
+  CLAUDE_CODE_API_LOCAL_ONLY_ERROR,
+  HETEROGENEOUS_PROVIDER_BINDING_LOCAL_ONLY_ERROR,
+  sanitizeClaudeCodeDirectArgs,
+  sanitizeClaudeCodeDirectEnv,
+} from './claudeCodeDirectEnv';
 export type {
   HeterogeneousAgentCliError,
   HeterogeneousAgentDescriptor,
@@ -16,10 +31,16 @@ export {
   buildHeterogeneousAgentCliNotFoundError,
   CLAUDE_CODE_CLI_INSTALL_COMMANDS,
   CLAUDE_CODE_CLI_INSTALL_DOCS_URL,
+  CODEBUDDY_CLI_INSTALL_COMMANDS,
+  CODEBUDDY_CLI_INSTALL_DOCS_URL,
   CODEX_CLI_INSTALL_COMMANDS,
   CODEX_CLI_INSTALL_DOCS_URL,
+  CURSOR_CLI_INSTALL_COMMANDS,
+  CURSOR_CLI_INSTALL_DOCS_URL,
   getHeterogeneousAgentConfig,
   getHeterogeneousAgentConfigOrThrow,
+  GROK_BUILD_CLI_INSTALL_COMMANDS,
+  GROK_BUILD_CLI_INSTALL_DOCS_URL,
   HETEROGENEOUS_AGENT_CONFIGS,
   isHeterogeneousAgentAuthRequired,
   isLocalHeterogeneousType,
@@ -66,6 +87,26 @@ export type {
   SetErrorIntent,
 } from './mainAgentCoordinator';
 export { createMainAgentRunState, reduceMainAgent } from './mainAgentCoordinator';
+export type {
+  EnabledProviderBindingModelRef,
+  HeterogeneousProviderBindingCapability,
+  HeterogeneousProviderBindingError,
+  HeterogeneousProviderBindingProtocol,
+  HeterogeneousProviderBindingReference,
+  HeterogeneousProviderBindingResolution,
+  HeterogeneousProviderBindingRuntime,
+  ResolveHeterogeneousProviderBindingInput,
+  ResolveHeterogeneousProviderBindingResult,
+} from './providerBinding';
+export {
+  formatHeterogeneousProviderBindingError,
+  getHeterogeneousProviderBindingCapability,
+  getProviderInferenceProtocols,
+  HETEROGENEOUS_PROVIDER_BINDING_AGENT_TYPES,
+  isHeterogeneousProviderBindingSupported,
+  resolveHeterogeneousProviderBinding,
+  resolveProviderBindingProtocol,
+} from './providerBinding';
 export { createAdapter, listAgentTypes, listLocalAgentTypes } from './registry';
 export type { HeterogeneousAgentScanMap, HeterogeneousAgentScanStatus } from './scan/types';
 export {

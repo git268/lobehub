@@ -2,9 +2,12 @@ import { normalizeVerifySurface } from '@lobechat/const/verify';
 import type {
   AcceptanceAttachment,
   AcceptanceCheckReviewAction,
+  AcceptanceRejectIntent,
   AcceptanceReviewAnnotation,
   AcceptanceStatus,
   AcceptanceSubjectType,
+  GoalStatus,
+  ReviewProposalOutcome,
   VerifyAgentPlanConfig,
   VerifyCheckDecisionDetail,
   VerifyCheckItem,
@@ -16,11 +19,15 @@ import debug from 'debug';
 import { AcceptanceModel } from '@/database/models/acceptance';
 import { AgentModel } from '@/database/models/agent';
 import { DocumentModel } from '@/database/models/document';
+import { GoalModel } from '@/database/models/goal';
+import { ProjectModel } from '@/database/models/project';
 import { TaskModel } from '@/database/models/task';
+import { TaskTopicModel } from '@/database/models/taskTopic';
 import { TopicModel } from '@/database/models/topic';
 import { VerifyCheckResultModel } from '@/database/models/verifyCheckResult';
 import { VerifyEvidenceModel } from '@/database/models/verifyEvidence';
 import { VerifyReportModel } from '@/database/models/verifyReport';
+import { VerifyReviewPredictionModel } from '@/database/models/verifyReviewPrediction';
 import { VerifyRunModel } from '@/database/models/verifyRun';
 import type {
   AcceptanceItem,
@@ -470,12 +477,39 @@ export class AcceptanceService {
     defaults?: { requirement?: string; title?: string },
   ): Promise<AcceptanceItem> => {
     await this.assertSubjectExists(subjectType, subjectId);
+    const projectId = await this.resolveSubjectProjectId(subjectType, subjectId);
     return this.acceptanceModel.ensureForSubject(subjectType, subjectId, {
+      projectId,
       requirement: defaults?.requirement,
       ...(subjectType === 'standalone' && defaults?.title
         ? { metadata: { title: defaults.title } }
         : {}),
     });
+  };
+
+  private resolveSubjectProjectId = async (
+    subjectType: AcceptanceSubjectType,
+    subjectId: string,
+  ): Promise<string | null> => {
+    if (subjectType === 'task') {
+      return (
+        (await new TaskModel(this.db, this.userId, this.workspaceId).resolve(subjectId))
+          ?.projectId ?? null
+      );
+    }
+    if (subjectType === 'topic') {
+      const taskTopic = await new TaskTopicModel(
+        this.db,
+        this.userId,
+        this.workspaceId,
+      ).findByTopicId(subjectId);
+      if (!taskTopic) return null;
+      return (
+        (await new TaskModel(this.db, this.userId, this.workspaceId).resolve(taskTopic.taskId))
+          ?.projectId ?? null
+      );
+    }
+    return null;
   };
 
   /**
@@ -531,9 +565,45 @@ export class AcceptanceService {
     const status = statusFromRound(current, Boolean(report));
     if (status !== acceptance.status) {
       await this.acceptanceModel.updateStatus(acceptanceId, status);
+      await this.mirrorGoalStatus(acceptance.subjectType, acceptance.subjectId, status);
       log('acceptance %s → %s (from round %d)', acceptanceId, status, current.roundIndex);
     }
     return status;
+  };
+
+  /**
+   * Keep a task-carried goal's live phase in lockstep with the acceptance
+   * lifecycle. Only the in-flight phases are mirrored here — the decision
+   * transitions (`achieved` / `paused` / `running` next round / `failed`) are
+   * written by their owning flows (accept / reject / settle / goal loop).
+   * Best-effort: goal state must never break acceptance recompute.
+   */
+  private mirrorGoalStatus = async (
+    subjectType: string,
+    subjectId: string,
+    status: AcceptanceStatus,
+  ): Promise<void> => {
+    if (subjectType !== 'task') return;
+    // `planned` is deliberately NOT mirrored: the plan being confirmed at run
+    // start says nothing about verification running — the round is still
+    // executing, and flipping the goal to `verifying` here would show 验证中
+    // for the whole execution phase (caught by the E2E acceptance run).
+    const mirrored: Partial<Record<AcceptanceStatus, GoalStatus>> = {
+      delivered: 'review',
+      repairing: 'verifying',
+      verifying: 'verifying',
+    };
+    const next = mirrored[status];
+    if (!next) return;
+
+    try {
+      const goalModel = new GoalModel(this.db, this.userId, this.workspaceId);
+      const goal = await goalModel.findBySubject('task', subjectId);
+      if (!goal || goal.status === 'achieved' || goal.status === 'canceled') return;
+      if (goal.status !== next) await goalModel.updateStatus(goal.id, next);
+    } catch (error) {
+      log('mirrorGoalStatus failed (non-fatal): %O', error);
+    }
   };
 
   /** Latest round of an aggregate — the row `stampDecision` would write to. */
@@ -561,15 +631,17 @@ export class AcceptanceService {
     return (await this.acceptanceModel.findById(acceptanceId))!;
   };
 
-  /** Flip a goal task's origin card to its terminal "done" state. Best-effort. */
+  /** Flip a goal (and its origin card) to the terminal "achieved" state. Best-effort. */
   private syncGoalStateOnAccept = async (subjectId: string): Promise<void> => {
     try {
       const taskModel = new TaskModel(this.db, this.userId, this.workspaceId);
       const task = await taskModel.findById(subjectId);
       if (!task) return;
-      const goal = taskModel.getGoalConfig(task);
+      const goalModel = new GoalModel(this.db, this.userId, this.workspaceId);
+      const goal = await goalModel.findBySubject('task', task.id);
       if (!goal) return;
 
+      await goalModel.updateStatus(goal.id, 'achieved');
       await syncGoalToolState({
         db: this.db,
         state: { phase: 'done', roundsRun: task.totalTopics || 0 },
@@ -617,7 +689,8 @@ export class AcceptanceService {
       const task = await taskModel.findById(subjectId);
       if (!task) return;
 
-      const goal = taskModel.getGoalConfig(task);
+      const goalModel = new GoalModel(this.db, this.userId, this.workspaceId);
+      const goal = await goalModel.findBySubject('task', task.id);
       if (!goal) return;
 
       const outcome = await maybeContinueGoalLoop({
@@ -627,6 +700,11 @@ export class AcceptanceService {
         userId: this.userId,
         workspaceId: this.workspaceId,
       });
+      // `continued` already flipped the goal to `running` inside the loop; a
+      // budget-blocked or failed spawn leaves the rejected goal parked on the
+      // user (raise the budget / retry), which is `paused` in the goal
+      // vocabulary.
+      if (outcome !== 'continued') await goalModel.updateStatus(goal.id, 'paused');
       log('reject on goal task %s → loop outcome: %s', task.identifier, outcome);
     } catch (error) {
       log('spawnGoalRoundOnReject failed (non-fatal): %O', error);
@@ -649,6 +727,10 @@ export class AcceptanceService {
       checkItemIds: string[];
       comment?: string;
       fileIds?: string[];
+      /** Recorded when this decision answered a model proposal. */
+      proposal?: Omit<ReviewProposalOutcome, 'respondedAt'>;
+      /** Which of the three jobs a reject is doing; absent means unclassified. */
+      rejectIntent?: AcceptanceRejectIntent;
     },
   ): Promise<{ resultIds: string[] }> => {
     const acceptance = await this.acceptanceModel.findById(acceptanceId);
@@ -705,19 +787,51 @@ export class AcceptanceService {
       ...(input.comment ? { comment: input.comment } : {}),
       ...(input.annotations?.length ? { annotations: input.annotations } : {}),
       ...(input.fileIds?.length ? { fileIds: input.fileIds } : {}),
+      // Only meaningful on a reject — an accept has no intent to classify.
+      ...(input.rejectIntent && input.action === 'reject'
+        ? { rejectIntent: input.rejectIntent }
+        : {}),
+      ...(input.proposal
+        ? { proposal: { ...input.proposal, respondedAt: new Date().toISOString() } }
+        : {}),
     };
 
-    await Promise.all(
-      [...targets.values()].map((result) => {
-        const { isFalsePositive, isFalseNegative } = computeFalseFlags(result.verdict, decision);
-        return this.resultModel.update(result.id, {
-          isFalseNegative,
-          isFalsePositive,
-          userDecision: decision,
-          userDecisionDetail: detail,
+    // One transaction for the decision AND the proposal's answer. Written
+    // separately, a failing second write left the check rejected while its
+    // prediction stayed unanswered — and the decision then HIDES the proposal,
+    // so nothing could ever reconcile the pair again. Agreement analysis reads
+    // those two rows as a matched set; a durable split is worse than failing.
+    await this.db.transaction(async (tx) => {
+      const resultModel = new VerifyCheckResultModel(tx, this.userId, this.workspaceId);
+
+      await Promise.all(
+        [...targets.values()].map((result) => {
+          const { isFalsePositive, isFalseNegative } = computeFalseFlags(result.verdict, decision);
+          return resultModel.update(result.id, {
+            isFalseNegative,
+            isFalsePositive,
+            userDecision: decision,
+            userDecisionDetail: detail,
+          });
+        }),
+      );
+
+      if (input.proposal) {
+        const answered = await new VerifyReviewPredictionModel(
+          tx,
+          this.userId,
+          this.workspaceId,
+        ).adjudicate(input.proposal.predictionId, {
+          adjudication: input.proposal.adjudication,
+          edit: input.proposal.edit,
         });
-      }),
-    );
+        // A zero-row update means the id was wrong or not ours; committing the
+        // decision alone would produce exactly the split this transaction exists
+        // to prevent.
+        if (!answered) throw new Error(`Proposal "${input.proposal.predictionId}" not found`);
+      }
+    });
+
     log('acceptance %s: %d check result(s) marked %s', acceptanceId, targets.size, decision);
     return { resultIds: [...targets.keys()] };
   };
@@ -817,6 +931,33 @@ export class AcceptanceService {
     };
   };
 
+  /** Resolve the projects referenced directly by acceptances in one bounded read. */
+  private resolveProjects = async (
+    acceptances: AcceptanceItem[],
+  ): Promise<Map<string, { id: string; name: string }>> => {
+    const result = new Map<string, { id: string; name: string }>();
+    const projectIds = [
+      ...new Set(acceptances.map(({ projectId }) => projectId).filter((id): id is string => !!id)),
+    ];
+    if (projectIds.length === 0) return result;
+
+    try {
+      const projects = await new ProjectModel(this.db, this.userId, this.workspaceId).findByIds(
+        projectIds,
+      );
+      const projectById = new Map(projects.map((project) => [project.id, project]));
+
+      for (const acceptance of acceptances) {
+        if (!acceptance.projectId) continue;
+        const project = projectById.get(acceptance.projectId);
+        if (project) result.set(acceptance.id, { id: project.id, name: project.name });
+      }
+    } catch (error) {
+      log('resolveProjects failed (non-fatal): %O', error);
+    }
+    return result;
+  };
+
   /**
    * The latest round's total-check count per acceptance — a cheap glance for the
    * list panel (two batched reads, never a per-row union recompute). The signed-
@@ -857,11 +998,15 @@ export class AcceptanceService {
    */
   listWithSubjects = async (limit = 50) => {
     const rows = await this.acceptanceModel.query(limit);
-    const checkCounts = await this.latestCheckCounts(rows.map((row) => row.id));
+    const [checkCounts, projects] = await Promise.all([
+      this.latestCheckCounts(rows.map((row) => row.id)),
+      this.resolveProjects(rows),
+    ]);
     return Promise.all(
       rows.map(async (row) => ({
         ...row,
         checkCount: checkCounts.get(row.id) ?? null,
+        project: projects.get(row.id) ?? null,
         subject: await this.resolveSubject(row),
       })),
     );

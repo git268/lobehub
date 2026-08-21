@@ -4,20 +4,25 @@ import type { HeterogeneousProviderConfig } from './agencyConfig';
 import {
   buildHeteroExecArgs,
   buildHeteroSpawnArgs,
-  codexModelSupportsFastSpeed,
-  codexModelSupportsReasoningEffort,
-  getCodexReasoningEffortLevels,
-  HETEROGENEOUS_AGENT_DEFAULT_SELECTION,
+  canPublishAgentTopicLink,
   normalizeHeterogeneousProviderConfig,
   pruneWorkingDirByDeviceDeletes,
   resolveAgencyConfig,
   resolveAgentAgencyConfig,
+  resolveAgentTopicSharePolicy,
+} from './agencyConfig';
+import {
+  AMP_AGENT_MODES,
+  codexModelSupportsFastSpeed,
+  getCodexReasoningEffortLevels,
+  HETEROGENEOUS_AGENT_DEFAULT_SELECTION,
+  resolveAmpAgentMode,
   resolveClaudeCodeModel,
   resolveClaudeCodeReasoningEffort,
   resolveCodexModel,
   resolveCodexReasoningEffort,
   resolveCodexSpeedMode,
-} from './agencyConfig';
+} from './heteroSelectorCapabilities';
 
 describe('normalizeHeterogeneousProviderConfig', () => {
   it('recovers a legacy adapterType before considering the command', () => {
@@ -105,14 +110,124 @@ describe('buildHeteroSpawnArgs', () => {
     ]);
   });
 
-  it('passes AMP native args through direct spawns and encodes them for lh hetero exec', () => {
+  it('resolves Amp mode from native args before the structured field', () => {
+    expect(resolveAmpAgentMode(undefined)).toBe(HETEROGENEOUS_AGENT_DEFAULT_SELECTION);
+    expect(resolveAmpAgentMode({ mode: 'high' })).toBe('high');
+    expect(resolveAmpAgentMode({ args: ['--mode=ultra'], mode: 'low' })).toBe('ultra');
+  });
+
+  it.each(AMP_AGENT_MODES)(
+    'forwards structured Amp mode %s through direct and legacy-compatible device paths',
+    (mode) => {
+      const provider: HeterogeneousProviderConfig = { mode, type: 'amp' };
+
+      expect(buildHeteroSpawnArgs(provider)).toEqual(['--mode', mode]);
+      expect(buildHeteroExecArgs(provider)).toEqual(['--agent-arg=--mode', `--agent-arg=${mode}`]);
+    },
+  );
+
+  it('does not override Amp mode when Default is selected', () => {
+    const provider: HeterogeneousProviderConfig = {
+      mode: HETEROGENEOUS_AGENT_DEFAULT_SELECTION,
+      type: 'amp',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toBeUndefined();
+    expect(buildHeteroExecArgs(provider)).toBeUndefined();
+  });
+
+  it('keeps raw Amp args compatible with direct spawns and lh hetero exec', () => {
     const provider: HeterogeneousProviderConfig = { args: ['--mode', 'high'], type: 'amp' };
 
     expect(buildHeteroSpawnArgs(provider)).toEqual(['--mode', 'high']);
     expect(buildHeteroExecArgs(provider)).toEqual(['--agent-arg=--mode', '--agent-arg=high']);
   });
 
-  it('forwards Qoder native args and model while leaving effort to the CLI default', () => {
+  it('forwards Cursor native args and configured model without duplicating --model', () => {
+    const provider: HeterogeneousProviderConfig = {
+      args: ['--mode', 'plan'],
+      model: 'sonnet-4-thinking',
+      type: 'cursor',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual([
+      '--mode',
+      'plan',
+      '--model',
+      'sonnet-4-thinking',
+    ]);
+    expect(buildHeteroExecArgs(provider)).toEqual([
+      '--agent-arg=--mode',
+      '--agent-arg=plan',
+      '--model',
+      'sonnet-4-thinking',
+    ]);
+    expect(
+      buildHeteroSpawnArgs({
+        args: ['--model', 'gpt-5'],
+        model: 'sonnet-4-thinking',
+        type: 'cursor',
+      }),
+    ).toEqual(['--model', 'gpt-5']);
+  });
+
+  it('forwards Grok Build model and effort through direct ACP and device execution', () => {
+    const provider: HeterogeneousProviderConfig = {
+      args: ['--no-subagents'],
+      effort: 'xhigh',
+      model: 'grok-4.6',
+      type: 'grok-build',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual([
+      '--no-subagents',
+      '--model',
+      'grok-4.6',
+      '--effort',
+      'xhigh',
+    ]);
+    expect(buildHeteroExecArgs(provider)).toEqual([
+      '--agent-arg=--no-subagents',
+      '--agent-arg=--model',
+      '--agent-arg=grok-4.6',
+      '--agent-arg=--effort',
+      '--agent-arg=xhigh',
+    ]);
+  });
+
+  it('keeps native Grok Build selector flags authoritative', () => {
+    const provider: HeterogeneousProviderConfig = {
+      args: ['-m=grok-build', '--reasoning-effort=low'],
+      effort: 'high',
+      model: 'grok-4.6',
+      type: 'grok-build',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual(['-m=grok-build', '--reasoning-effort=low']);
+    expect(buildHeteroExecArgs(provider)).toEqual([
+      '--agent-arg=-m=grok-build',
+      '--agent-arg=--reasoning-effort=low',
+    ]);
+  });
+
+  it('keeps TRAE model selection in the wrapper instead of native process arguments', () => {
+    const provider: HeterogeneousProviderConfig = {
+      args: ['--feature', 'test'],
+      effort: 'high',
+      model: 'ignored-selector',
+      type: 'trae',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual(['--feature', 'test']);
+    expect(buildHeteroExecArgs(provider)).toEqual([
+      '--agent-arg=--feature',
+      '--agent-arg=test',
+      '--model',
+      'ignored-selector',
+    ]);
+  });
+
+  it('forwards Qoder native args, model, and reasoning effort', () => {
     const provider: HeterogeneousProviderConfig = {
       args: ['--verbose'],
       effort: 'high',
@@ -120,15 +235,39 @@ describe('buildHeteroSpawnArgs', () => {
       type: 'qoder',
     };
 
-    expect(buildHeteroSpawnArgs(provider)).toEqual(['--verbose', '--model', 'qoder-model']);
+    expect(buildHeteroSpawnArgs(provider)).toEqual([
+      '--verbose',
+      '--model',
+      'qoder-model',
+      '--reasoning-effort',
+      'high',
+    ]);
     expect(buildHeteroExecArgs(provider)).toEqual([
       '--agent-arg=--verbose',
       '--model',
       'qoder-model',
+      '--effort',
+      'high',
     ]);
   });
 
-  it('preserves a Qoder model from native args and does not inject Default', () => {
+  it('forwards Kimi Code native args and an explicit model through both spawn paths', () => {
+    const provider: HeterogeneousProviderConfig = {
+      args: ['--verbose'],
+      effort: 'high',
+      model: 'kimi-for-coding',
+      type: 'kimi-code',
+    };
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual(['--verbose', '--model', 'kimi-for-coding']);
+    expect(buildHeteroExecArgs(provider)).toEqual([
+      '--agent-arg=--verbose',
+      '--model',
+      'kimi-for-coding',
+    ]);
+  });
+
+  it('preserves Qoder model and reasoning effort from native args without injecting duplicates', () => {
     expect(
       buildHeteroSpawnArgs({
         args: ['-m', 'native-model'],
@@ -143,6 +282,20 @@ describe('buildHeteroSpawnArgs', () => {
         type: 'qoder',
       }),
     ).toEqual(['--agent-arg=--model=native-model']);
+    expect(
+      buildHeteroSpawnArgs({
+        args: ['--reasoning-effort', 'max'],
+        effort: 'high',
+        type: 'qoder',
+      }),
+    ).toEqual(['--reasoning-effort', 'max']);
+    expect(
+      buildHeteroExecArgs({
+        args: ['--reasoning-effort=max'],
+        effort: 'high',
+        type: 'qoder',
+      }),
+    ).toEqual(['--agent-arg=--reasoning-effort=max']);
     expect(
       buildHeteroSpawnArgs({
         model: HETEROGENEOUS_AGENT_DEFAULT_SELECTION,
@@ -265,6 +418,13 @@ describe('buildHeteroSpawnArgs', () => {
       '--effort',
       'high',
     ]);
+  });
+
+  it('appends CodeBuddy model and effort using its Claude-compatible CLI flags', () => {
+    const provider = { effort: 'high', model: 'gpt-5.4', type: 'codebuddy' } as const;
+
+    expect(buildHeteroSpawnArgs(provider)).toEqual(['--model', 'gpt-5.4', '--effort', 'high']);
+    expect(buildHeteroExecArgs(provider)).toEqual(['--model', 'gpt-5.4', '--effort', 'high']);
   });
 
   it('preserves existing args and appends after them', () => {
@@ -437,14 +597,6 @@ describe('codex reasoning effort capabilities', () => {
     expect(getCodexReasoningEffortLevels('gpt-5.6-sol')).toEqual(ultraLevels);
     expect(getCodexReasoningEffortLevels('gpt-5.6-terra')).toEqual(ultraLevels);
     expect(getCodexReasoningEffortLevels('gpt-5.6-luna')).toEqual(maxLevels);
-  });
-
-  it('reports model-specific Max and Ultra support', () => {
-    expect(codexModelSupportsReasoningEffort('gpt-5.6', 'ultra')).toBe(true);
-    expect(codexModelSupportsReasoningEffort('gpt-5.6-sol', 'ultra')).toBe(true);
-    expect(codexModelSupportsReasoningEffort('gpt-5.6-terra', 'ultra')).toBe(true);
-    expect(codexModelSupportsReasoningEffort('gpt-5.6-luna', 'max')).toBe(true);
-    expect(codexModelSupportsReasoningEffort('gpt-5.6-luna', 'ultra')).toBe(false);
   });
 
   it('uses conservative common levels for old, unknown, and default models', () => {
@@ -699,5 +851,64 @@ describe('resolveAgentAgencyConfig', () => {
         { canManage: true, visibility: 'public', workspaceId: 'workspace-1' },
       ),
     ).toEqual({ boundDeviceId: 'shared-device', executionTarget: 'device' });
+  });
+});
+
+describe('resolveAgentTopicSharePolicy', () => {
+  it('never restricts a personal agent — there is nobody to restrict', () => {
+    expect(
+      resolveAgentTopicSharePolicy({
+        agencyConfig: { topicSharePolicy: 'restricted' },
+        workspaceId: null,
+      }),
+    ).toBe('member');
+  });
+
+  it('keeps legacy workspace rows on the behaviour they were created with', () => {
+    expect(resolveAgentTopicSharePolicy({ workspaceId: 'workspace-1' })).toBe('member');
+    expect(resolveAgentTopicSharePolicy({ agencyConfig: {}, workspaceId: 'workspace-1' })).toBe(
+      'member',
+    );
+  });
+
+  it('honours an explicit restriction on a workspace agent', () => {
+    expect(
+      resolveAgentTopicSharePolicy({
+        agencyConfig: { topicSharePolicy: 'restricted' },
+        workspaceId: 'workspace-1',
+      }),
+    ).toBe('restricted');
+  });
+});
+
+describe('canPublishAgentTopicLink', () => {
+  const restricted = {
+    agencyConfig: { topicSharePolicy: 'restricted' as const },
+    userId: 'author',
+    workspaceId: 'workspace-1',
+  };
+
+  it('falls back to the role gate when no agent resolved', () => {
+    // Legacy session-only topics, or a row the caller cannot read: there is no
+    // policy to apply, so this must not become a second, silent denial.
+    expect(canPublishAgentTopicLink(undefined, { userId: 'member' })).toBe(true);
+    expect(canPublishAgentTopicLink(null, { userId: 'member' })).toBe(true);
+  });
+
+  it('blocks a plain member on a restricted agent', () => {
+    expect(canPublishAgentTopicLink(restricted, { userId: 'member' })).toBe(false);
+  });
+
+  it('lets the agent author and workspace owners through', () => {
+    expect(canPublishAgentTopicLink(restricted, { userId: 'author' })).toBe(true);
+    expect(canPublishAgentTopicLink(restricted, { isWorkspaceOwner: true, userId: 'member' })).toBe(
+      true,
+    );
+  });
+
+  it('does not match an author against a missing viewer id', () => {
+    expect(canPublishAgentTopicLink({ ...restricted, userId: null }, { userId: undefined })).toBe(
+      false,
+    );
   });
 });

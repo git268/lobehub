@@ -1,6 +1,12 @@
 'use client';
 
-import type { AcceptanceGroupFeedback, AcceptanceReviewAnnotation } from '@lobechat/types';
+import type {
+  AcceptanceGroupFeedback,
+  AcceptanceRejectIntent,
+  AcceptanceReviewAnnotation,
+  ReviewAdjudication,
+  ReviewProposalEdit,
+} from '@lobechat/types';
 import {
   ActionIcon,
   copyToClipboard,
@@ -37,10 +43,11 @@ import {
   Route,
   XCircle,
 } from 'lucide-react';
-import { Fragment, memo, useState } from 'react';
+import { Fragment, memo, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import AudioPlayer from '@/features/AudioPlayer';
+import { useIsHydrated } from '@/hooks/useIsHydrated';
 import type { AcceptanceBundle } from '@/services/verify';
 
 import {
@@ -62,6 +69,10 @@ import { AnnotatedImage } from './Annotation';
 import { AttachmentThumbs } from './attachments';
 import { openCheckRejectModal } from './CheckRejectModal';
 import { openGroupFeedbackModal } from './modals';
+import type { CheckProposal } from './proposal';
+import { classifyProposalEdit } from './proposal';
+import ProposalCard from './ProposalCard';
+import { ScreenshotTiles } from './ScreenshotTiles';
 
 export type AcceptanceCheck = AcceptanceBundle['checks'][number];
 export type AcceptanceCheckState = AcceptanceCheck['state'];
@@ -80,6 +91,17 @@ export interface CheckReviewInput {
   checkItemIds: string[];
   comment?: string;
   fileIds?: string[];
+  /** Present when this decision answered a model proposal. */
+  proposal?: { adjudication: ReviewAdjudication; edit?: ReviewProposalEdit; predictionId: string };
+  /** Which of the three jobs a reject is doing. */
+  rejectIntent?: AcceptanceRejectIntent;
+}
+
+/** Answering a model proposal without ruling on the check. */
+export interface ProposalDismissInput {
+  adjudication: 'misidentified' | 'not-an-issue';
+  checkItemId: string;
+  predictionId: string;
 }
 
 /** The user's standing verdict on a check — `pending` means "awaiting your confirmation". */
@@ -96,6 +118,10 @@ export const userReviewState = (check: AcceptanceCheck): UserReviewState => {
 /** Accepted and ignored checks are terminal — there is no remaining work to send back. */
 export const isCheckWorkActionable = (check: AcceptanceCheck): boolean =>
   ['pending', 'rejected'].includes(userReviewState(check));
+
+/** A successful review decision moves the reviewer forward by folding the finished row. */
+export const shouldCollapseAfterReview = (succeeded: boolean, expanded: boolean): boolean =>
+  succeeded && expanded;
 
 /** Every reviewable check in the group is user-accepted — settled business. */
 export const isGroupFullyAccepted = (checks: AcceptanceCheck[]): boolean => {
@@ -238,16 +264,15 @@ const styles = createStaticStyles(({ css }) => ({
 
     animation: acceptance-celebrate-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
   `,
+  /* No card chrome: the row separators alone carry the list's structure. A
+     border plus inline padding stole horizontal room from every row and made a
+     long checklist read as a boxed-in panel rather than a dense inventory. */
   groupCard: css`
-    overflow: hidden;
-    border: 1px solid ${cssVar.colorBorderSecondary};
-    border-radius: ${cssVar.borderRadiusLG};
     background: ${cssVar.colorBgContainer};
   `,
   groupHeader: css`
     cursor: pointer;
     padding-block: 10px;
-    padding-inline: 16px;
     background: ${cssVar.colorFillQuaternary};
 
     .acceptance-group-actions {
@@ -280,9 +305,9 @@ const styles = createStaticStyles(({ css }) => ({
   row: css`
     border-block-start: 1px solid ${cssVar.colorBorderSecondary};
 
-    /* The card already draws the outer border — a first row's separator would
-       stack on it and read as a 2px top edge. Grouped lists are unaffected:
-       their first child is the group header, so rows are never first. */
+    /* The list opens flush with the content above it. Grouped lists are
+       unaffected: their first child is the group header, so rows are never
+       first. */
     &:first-child {
       border-block-start: none;
     }
@@ -319,7 +344,6 @@ const styles = createStaticStyles(({ css }) => ({
   rowHeader: css`
     cursor: pointer;
     padding-block: 12px;
-    padding-inline: 16px;
 
     &:hover,
     &:focus-within {
@@ -391,17 +415,28 @@ const imageRatio = (item: AcceptanceEvidence): string | undefined =>
   item.fileWidth && item.fileHeight ? `${item.fileWidth} / ${item.fileHeight}` : undefined;
 
 /** Flat media for a comparison side — the card frames it, so no own border/radius. */
-const comparisonContent = (item: AcceptanceEvidence) =>
-  item.type === 'video' ? (
-    <video controls src={item.fileUrl!} style={{ display: 'block', width: '100%' }} />
-  ) : item.type === 'audio' ? (
-    <AudioPlayer
-      fullWidth
-      alt={item.description ?? item.fileName ?? item.type}
-      downloadFileName={item.fileName ?? 'audio'}
-      url={item.fileUrl!}
-    />
-  ) : (
+const comparisonContent = (item: AcceptanceEvidence) => {
+  if (item.type === 'video')
+    return <video controls src={item.fileUrl!} style={{ display: 'block', width: '100%' }} />;
+  if (item.type === 'audio')
+    return (
+      <AudioPlayer
+        fullWidth
+        alt={item.description ?? item.fileName ?? item.type}
+        downloadFileName={item.fileName ?? 'audio'}
+        url={item.fileUrl!}
+      />
+    );
+  if (item.type === 'screenshot' && item.fileUrl)
+    return (
+      <ScreenshotTiles
+        alt={item.description ?? item.fileName ?? item.type}
+        fileHeight={item.fileHeight}
+        fileWidth={item.fileWidth}
+        src={item.fileUrl}
+      />
+    );
+  return (
     <Image
       preview
       alt={item.description ?? item.fileName ?? item.type}
@@ -411,8 +446,21 @@ const comparisonContent = (item: AcceptanceEvidence) =>
       variant={'borderless'}
     />
   );
+};
 
-const EvidenceList = memo<{ evidence: AcceptanceEvidence[] }>(({ evidence }) => {
+const EvidenceList = memo<{
+  evidence: AcceptanceEvidence[];
+  /**
+   * Regions to draw over an evidence image, keyed by evidence id. Used by the
+   * AI proposal: rather than the card rendering its own copy of the screenshot
+   * (which showed the same image twice in one row), the boxes land on the image
+   * that is already here.
+   */
+  overlays?: Map<
+    string,
+    { comment?: string; label?: number; rect: AcceptanceReviewAnnotation['rect'] }[]
+  >;
+}>(({ evidence, overlays }) => {
   const sorted = [...evidence].sort((a, b) => (isVisual(b) ? 1 : 0) - (isVisual(a) ? 1 : 0));
   if (sorted.length === 0) return null;
 
@@ -442,9 +490,12 @@ const EvidenceList = memo<{ evidence: AcceptanceEvidence[] }>(({ evidence }) => 
     content: comparisonContent(item),
   });
 
+  const consumedScreenshotIds = new Set<string>();
+
   return (
     <Flexbox gap={12}>
       {sorted.map((item) => {
+        if (consumedScreenshotIds.has(item.id)) return null;
         if (pairedIds.has(item.id)) {
           const comparison = readEvidenceComparison(item.metadata)!;
           // The pair renders once, anchored at its `before` half.
@@ -487,38 +538,86 @@ const EvidenceList = memo<{ evidence: AcceptanceEvidence[] }>(({ evidence }) => 
               {caption}
             </Flexbox>
           );
-        if (item.fileUrl && IMAGE_EVIDENCE.has(item.type))
+        const overlay = overlays?.get(item.id);
+        if (item.fileUrl && item.type === 'screenshot') {
+          const run = [item];
+          const start = sorted.indexOf(item);
+          for (let index = start + 1; index < sorted.length; index++) {
+            const next = sorted[index]!;
+            if (pairedIds.has(next.id) || !next.fileUrl || next.type !== 'screenshot') break;
+            run.push(next);
+            consumedScreenshotIds.add(next.id);
+          }
+          return (
+            <Flexbox
+              horizontal
+              align={'flex-start'}
+              gap={12}
+              key={item.id}
+              style={{ maxWidth: '100%' }}
+              wrap={'wrap'}
+            >
+              {run.map((shot) => {
+                const shotCaption = meaningfulEvidenceCaption(shot.description);
+                return (
+                  <ScreenshotTiles
+                    alt={shot.description ?? shot.fileName ?? shot.type}
+                    annotations={overlays?.get(shot.id)}
+                    fileHeight={shot.fileHeight}
+                    fileWidth={shot.fileWidth}
+                    key={shot.id}
+                    src={shot.fileUrl!}
+                    caption={
+                      shotCaption ? (
+                        <span className={styles.caption}>{shotCaption}</span>
+                      ) : undefined
+                    }
+                  />
+                );
+              })}
+            </Flexbox>
+          );
+        }
+        if (item.fileUrl && IMAGE_EVIDENCE.has(item.type)) {
           return (
             <Flexbox gap={4} key={item.id} style={{ maxWidth: '100%', width: 'fit-content' }}>
-              {/* The frame owns the border — the inner Image must not draw its
-                  own, or the two 1px borders stack visibly. The frame also
-                  reserves the aspect ratio so the row's height is settled
-                  before the image loads (no expand jump). */}
-              <Flexbox
-                className={styles.evidenceImage}
-                style={
-                  item.fileWidth && item.fileHeight
-                    ? { aspectRatio: imageRatio(item), maxWidth: '100%', width: item.fileWidth }
-                    : undefined
-                }
-              >
-                <Image
-                  alt={item.description ?? item.fileName ?? item.type}
-                  loading={'lazy'}
+              {overlay?.length ? (
+                <AnnotatedImage
+                  annotations={overlay}
+                  showComments={false}
                   src={item.fileUrl}
-                  variant={'borderless'}
-                  style={{
-                    borderRadius: 0,
-                    maxWidth: '100%',
-                    // Fill the ratio-reserving frame; without known dimensions
-                    // the image keeps its intrinsic size (legacy evidence).
-                    width: item.fileWidth && item.fileHeight ? '100%' : undefined,
-                  }}
+                  imageStyle={
+                    item.fileWidth && item.fileHeight
+                      ? { aspectRatio: imageRatio(item), maxWidth: '100%', width: item.fileWidth }
+                      : undefined
+                  }
                 />
-              </Flexbox>
+              ) : (
+                <Flexbox
+                  className={styles.evidenceImage}
+                  style={
+                    item.fileWidth && item.fileHeight
+                      ? { aspectRatio: imageRatio(item), maxWidth: '100%', width: item.fileWidth }
+                      : undefined
+                  }
+                >
+                  <Image
+                    alt={item.description ?? item.fileName ?? item.type}
+                    loading={'lazy'}
+                    src={item.fileUrl}
+                    variant={'borderless'}
+                    style={{
+                      borderRadius: 0,
+                      maxWidth: '100%',
+                      width: item.fileWidth && item.fileHeight ? '100%' : undefined,
+                    }}
+                  />
+                </Flexbox>
+              )}
               {caption}
             </Flexbox>
           );
+        }
         if (item.content && markdownTextEvidenceTypes.has(item.type))
           return (
             <Flexbox gap={4} key={item.id}>
@@ -555,12 +654,13 @@ const EvidenceList = memo<{ evidence: AcceptanceEvidence[] }>(({ evidence }) => 
  */
 const AcceptedNote = memo<{ review: AcceptanceCheckReviewEntry }>(({ review }) => {
   const { t } = useTranslation('verify');
+  const hydrated = useIsHydrated();
   return (
     <Flexbox horizontal align={'center'} gap={6}>
       <Icon color={cssVar.colorTextQuaternary} icon={BadgeCheck} size={13} />
       <Text fontSize={12} type={'secondary'}>
         {t('acceptance.review.acceptedNote', {
-          time: dayjs(review.createdAt).format('MM-DD HH:mm'),
+          time: hydrated ? dayjs(review.createdAt).format('MM-DD HH:mm') : '',
         })}
       </Text>
     </Flexbox>
@@ -569,12 +669,13 @@ const AcceptedNote = memo<{ review: AcceptanceCheckReviewEntry }>(({ review }) =
 
 const IgnoredNote = memo<{ review: AcceptanceCheckReviewEntry }>(({ review }) => {
   const { t } = useTranslation('verify');
+  const hydrated = useIsHydrated();
   return (
     <Flexbox horizontal align={'center'} gap={6}>
       <Icon color={cssVar.colorTextQuaternary} icon={Ban} size={13} />
       <Text fontSize={12} type={'secondary'}>
         {t('acceptance.review.ignoredNote', {
-          time: dayjs(review.createdAt).format('MM-DD HH:mm'),
+          time: hydrated ? dayjs(review.createdAt).format('MM-DD HH:mm') : '',
         })}
       </Text>
     </Flexbox>
@@ -591,6 +692,7 @@ const FeedbackCard = memo<{
   review: AcceptanceCheckReviewEntry;
 }>(({ evidenceById, review }) => {
   const { t } = useTranslation('verify');
+  const hydrated = useIsHydrated();
   if (review.action === 'accept') return <AcceptedNote review={review} />;
   if (review.action === 'ignore') return <IgnoredNote review={review} />;
 
@@ -612,7 +714,7 @@ const FeedbackCard = memo<{
           {t('acceptance.review.feedbackLabel')}
         </Text>
         <Text fontSize={12} type={'secondary'}>
-          {dayjs(review.createdAt).format('MM-DD HH:mm')}
+          {hydrated ? dayjs(review.createdAt).format('MM-DD HH:mm') : null}
         </Text>
       </Flexbox>
       {review.comment && <Text style={{ fontSize: 12 }}>{review.comment}</Text>}
@@ -831,6 +933,8 @@ const CheckRow = memo<{
   check: AcceptanceCheck;
   detailMode?: boolean;
   expanded: boolean;
+  /** Answer a model proposal WITHOUT ruling on the check itself. */
+  onDismissProposal?: (input: ProposalDismissInput) => Promise<void>;
   onReview: (input: CheckReviewInput) => Promise<boolean>;
   onRound?: (round: number) => void;
   /** Open an agent judge's verification run (its trace IS the argument). */
@@ -843,6 +947,7 @@ const CheckRow = memo<{
     check,
     detailMode,
     expanded,
+    onDismissProposal,
     onOpenTrace,
     onReview,
     onRound,
@@ -857,6 +962,9 @@ const CheckRow = memo<{
     const [ignoring, setIgnoring] = useState(false);
     const [rejecting, setRejecting] = useState(false);
     const [reviewComment, setReviewComment] = useState('');
+    // The proposal starts folded: it is a suggestion, and an open panel on every
+    // unreviewed check would push the evidence the reviewer came for below the fold.
+    const [proposalOpen, setProposalOpen] = useState(false);
     const meta = STATE_META[check.state];
     const counts = evidenceCounts(check.evidence);
     const visualization = readVisualizationManifest(check.result?.metadata);
@@ -871,16 +979,41 @@ const CheckRow = memo<{
         : undefined;
     const historyReviews = check.reviews.filter((entry) => entry !== activeReview);
     const evidenceById = collectEvidenceById(check);
+
+    // Regions the proposal wants drawn on the evidence images already in this
+    // row. Numbered across the whole proposal (not per image), so "区域 2" in
+    // the card means the same box wherever it lives. Only while the card is
+    // open — boxes with no visible explanation read as a defect of the evidence.
+    const proposalOverlays = useMemo(() => {
+      if (!proposalOpen || !check.prediction) return undefined;
+      const map = new Map<
+        string,
+        { comment?: string; label?: number; rect: AcceptanceReviewAnnotation['rect'] }[]
+      >();
+      (check.prediction.annotations ?? []).forEach((annotation, index) => {
+        const bucket = map.get(annotation.evidenceId) ?? [];
+        bucket.push({ comment: annotation.comment, label: index + 1, rect: annotation.rect });
+        map.set(annotation.evidenceId, bucket);
+      });
+      return map.size > 0 ? map : undefined;
+    }, [proposalOpen, check.prediction]);
     const hasHistory = check.revisions > 1 || historyReviews.length > 0;
 
-    const openReject = () =>
+    /**
+     * @param fromProposal - when set, the modal opens prefilled with the
+     *   model's note and regions, and the submitted result is diffed against it
+     *   so the signal records WHICH part of the proposal was wrong.
+     */
+    const openReject = (fromProposal?: CheckProposal) =>
       openCheckRejectModal({
+        checkDescription: check.planItem?.description,
         checkTitle: `C${check.seq} · ${check.title}`,
         draftKey: check.id,
         evidence: check.evidence
           .filter((item) => isAnnotatable(item))
           .map((item) => ({ fileUrl: item.fileUrl!, id: item.id })),
-        initialComment: reviewComment,
+        initialAnnotations: fromProposal?.annotations ?? undefined,
+        initialComment: fromProposal?.comment ?? reviewComment,
         onConfirm: async ({ annotations, comment, fileIds }) => {
           const ok = await onReview({
             action: 'reject',
@@ -888,11 +1021,38 @@ const CheckRow = memo<{
             checkItemIds: [check.id],
             comment: comment || undefined,
             fileIds: fileIds.length > 0 ? fileIds : undefined,
+            ...(fromProposal
+              ? {
+                  proposal: {
+                    adjudication: 'confirmed' as const,
+                    edit: classifyProposalEdit(fromProposal, { annotations, comment }),
+                    predictionId: fromProposal.id,
+                  },
+                }
+              : {}),
           });
-          if (ok) setReviewComment('');
+          if (ok) {
+            setReviewComment('');
+            if (shouldCollapseAfterReview(ok, expanded)) onToggle();
+          }
           return ok;
         },
       });
+
+    /**
+     * Dismissing a proposal is NOT a review of the check — the check stays
+     * pending and the reviewer still has to judge it. Only the model's opinion
+     * is being answered, so this writes the outcome without touching
+     * `user_decision`.
+     */
+    const handleAdjudicate = async (adjudication: 'not-an-issue' | 'misidentified') => {
+      if (!check.prediction) return;
+      await onDismissProposal?.({
+        adjudication,
+        checkItemId: check.id,
+        predictionId: check.prediction.id,
+      });
+    };
 
     // Accepting settles the check — the row folds itself away once the write
     // lands, so the reviewer's eye moves on to what still needs judgment.
@@ -907,7 +1067,7 @@ const CheckRow = memo<{
       });
       setAccepting(false);
       if (ok) setReviewComment('');
-      if (ok && expanded) onToggle();
+      if (shouldCollapseAfterReview(ok, expanded)) onToggle();
     };
 
     const handleReject = async (event: { stopPropagation: () => void }) => {
@@ -915,9 +1075,14 @@ const CheckRow = memo<{
       const comment = reviewComment.trim();
       if (!comment) return;
       setRejecting(true);
-      const ok = await onReview({ action: 'reject', checkItemIds: [check.id], comment });
+      const ok = await onReview({
+        action: 'reject',
+        checkItemIds: [check.id],
+        comment,
+      });
       setRejecting(false);
       if (ok) setReviewComment('');
+      if (shouldCollapseAfterReview(ok, expanded)) onToggle();
     };
 
     const handleIgnore = async (event: { stopPropagation: () => void }) => {
@@ -925,7 +1090,7 @@ const CheckRow = memo<{
       setIgnoring(true);
       const ok = await onReview({ action: 'ignore', checkItemIds: [check.id] });
       setIgnoring(false);
-      if (ok && expanded) onToggle();
+      if (shouldCollapseAfterReview(ok, expanded)) onToggle();
     };
 
     // The user's standing verdict owns the head slot: a reject replaces the
@@ -1141,11 +1306,22 @@ const CheckRow = memo<{
         )}
 
         {expanded && (
-          <Flexbox
-            gap={10}
-            paddingBlock={detailMode ? 0 : '0 14px'}
-            paddingInline={detailMode ? 0 : 16}
-          >
+          <Flexbox gap={10} paddingBlock={detailMode ? 0 : '0 14px'} paddingInline={0}>
+            {/* The model's proposal leads the detail: it is a claim about this
+              check that the reviewer is being asked to rule on, so it belongs
+              above the verifier's narrative rather than buried under it.
+              Suppressed once a verdict exists — see the bundle read, which
+              already drops it; this guard covers the optimistic window. */}
+            {check.prediction && reviewable && !activeReview && (
+              <ProposalCard
+                open={proposalOpen}
+                pending={reviewPending}
+                proposal={check.prediction}
+                onAdjudicate={handleAdjudicate}
+                onConfirm={() => openReject(check.prediction ?? undefined)}
+                onToggle={setProposalOpen}
+              />
+            )}
             {/* The verifier's account of what it saw. Clamping it to two lines
               hid the middle of the argument behind an ellipsis with no way to
               open it — in a detail view there is nothing to preview. */}
@@ -1177,7 +1353,7 @@ const CheckRow = memo<{
                 </Flexbox>
               )}
             {visualization && <VisualizationRenderer manifest={visualization} />}
-            <EvidenceList evidence={check.evidence} />
+            <EvidenceList evidence={check.evidence} overlays={proposalOverlays} />
 
             {check.state === 'not_executed' && (
               <Flexbox
@@ -1437,6 +1613,8 @@ const CheckRow = memo<{
 interface FocusedCheckDetailsProps {
   canReview: boolean;
   check: AcceptanceCheck;
+  /** Answer a model proposal without ruling on the check itself. */
+  onDismissProposal?: (input: ProposalDismissInput) => Promise<void>;
   /** Open an agent judge's verification run (its trace IS the argument). */
   onOpenTrace?: (verifierOperationId: string) => void | Promise<void>;
   onReview: (input: CheckReviewInput) => Promise<boolean>;
@@ -1446,13 +1624,14 @@ interface FocusedCheckDetailsProps {
 
 /** Full check content for the dedicated second-level acceptance workspace. */
 export const FocusedCheckDetails = memo<FocusedCheckDetailsProps>(
-  ({ canReview, check, onOpenTrace, onReview, onRound, reviewPending }) => (
+  ({ canReview, check, onDismissProposal, onOpenTrace, onReview, onRound, reviewPending }) => (
     <CheckRow
       detailMode
       expanded
       canReview={canReview}
       check={check}
       reviewPending={reviewPending}
+      onDismissProposal={onDismissProposal}
       onOpenTrace={onOpenTrace}
       onReview={onReview}
       onRound={onRound}
@@ -1531,6 +1710,8 @@ interface CheckListProps {
   filter: CheckFilter;
   /** Group-scoped feedback entries recorded on the aggregate. */
   groupFeedback: AcceptanceGroupFeedback[];
+  /** Answer a model proposal without ruling on the check itself. */
+  onDismissProposal?: (input: ProposalDismissInput) => Promise<void>;
   /** Record group-scoped feedback; resolves true when the write landed. */
   onGroupFeedback: (category: string, comment: string, fileIds: string[]) => Promise<boolean>;
   /** Open an agent judge's verification run (its trace IS the argument). */
@@ -1556,6 +1737,7 @@ const CheckList = memo<CheckListProps>(
     expanded,
     filter,
     groupFeedback,
+    onDismissProposal,
     onGroupFeedback,
     onReview,
     onOpenTrace,
@@ -1567,6 +1749,7 @@ const CheckList = memo<CheckListProps>(
     round,
   }) => {
     const { t } = useTranslation('verify');
+    const hydrated = useIsHydrated();
     const [acceptingGroup, setAcceptingGroup] = useState<string | null>(null);
 
     const visible = (check: AcceptanceCheck) =>
@@ -1646,6 +1829,7 @@ const CheckList = memo<CheckListProps>(
               expanded={expanded.has(check.id)}
               key={check.id}
               reviewPending={reviewPending}
+              onDismissProposal={onDismissProposal}
               onOpenTrace={onOpenTrace}
               onReview={onReview}
               onRound={onRound}
@@ -1866,7 +2050,7 @@ const CheckList = memo<CheckListProps>(
                             {t('acceptance.group.feedbackLabel')}
                           </Text>
                           <Text fontSize={12} type={'secondary'}>
-                            {dayjs(entry.createdAt).format('MM-DD HH:mm')}
+                            {hydrated ? dayjs(entry.createdAt).format('MM-DD HH:mm') : null}
                           </Text>
                         </Flexbox>
                         <Text style={{ fontSize: 12 }}>{entry.comment}</Text>
@@ -1884,6 +2068,7 @@ const CheckList = memo<CheckListProps>(
                     expanded={expanded.has(check.id)}
                     key={check.id}
                     reviewPending={reviewPending}
+                    onDismissProposal={onDismissProposal}
                     onOpenTrace={onOpenTrace}
                     onReview={onReview}
                     onRound={onRound}

@@ -61,13 +61,7 @@ export const useVerifyReportBundle = (verifyRunId: string | null) =>
     VERIFY_REPORT_SWR_CONFIG,
   );
 
-/** Cross-round acceptance decision bundle by acceptance id. */
-export const useAcceptanceBundle = (acceptanceId: string | null) =>
-  useClientDataSWR(
-    acceptanceId ? verifyKeys.acceptanceBundle(acceptanceId) : null,
-    () => verifyService.getAcceptanceBundle(acceptanceId!),
-    ACCEPTANCE_BUNDLE_SWR_CONFIG,
-  );
+export { useAcceptanceBundle } from './Acceptance/useAcceptanceBundle';
 
 /** The optional acceptance aggregate attached to a task/topic/document subject. */
 export const useAcceptanceBySubject = (
@@ -92,6 +86,27 @@ export const useAcceptanceList = (enabled: boolean) =>
     enabled ? verifyKeys.acceptances() : null,
     () => verifyService.listAcceptances(),
     VERIFY_REPORT_SWR_CONFIG,
+  );
+
+/**
+ * Acceptance status for a known subject set — one read for a whole list.
+ *
+ * Not `useAcceptanceList`: that feed is capped at the newest rows across every
+ * subject type, so any subject pushed past the cap would read as having no
+ * acceptance at all. Revalidates on focus like the bundle, because a delivery
+ * that lands while the tab sits open has to show up without a reload.
+ */
+export const useAcceptanceStatuses = (
+  subjectType: AcceptanceSubjectType,
+  subjectIds: string[],
+  enabled = true,
+) =>
+  useClientDataSWR(
+    enabled && subjectIds.length > 0
+      ? verifyKeys.acceptanceStatuses(subjectType, subjectIds)
+      : null,
+    () => verifyService.listAcceptanceStatuses(subjectType, subjectIds),
+    ACCEPTANCE_BUNDLE_SWR_CONFIG,
   );
 
 /**

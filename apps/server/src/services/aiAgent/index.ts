@@ -38,6 +38,7 @@ import {
   type AgentGroupConfig,
   type AgentManagementContext,
   type BotPlatformContext,
+  buildExpertiseContextSnapshot,
   type LobeToolManifest,
   SkillEngine,
   type ToolExecutor,
@@ -46,7 +47,12 @@ import {
 } from '@lobechat/context-engine';
 import type { LobeChatDatabase } from '@lobechat/database';
 import type { HeterogeneousAgentType } from '@lobechat/heterogeneous-agents';
-import { isRemoteHeterogeneousType } from '@lobechat/heterogeneous-agents';
+import {
+  getHeterogeneousAgentConfig,
+  HETEROGENEOUS_PROVIDER_BINDING_LOCAL_ONLY_ERROR,
+  isLocalHeterogeneousType,
+  isRemoteHeterogeneousType,
+} from '@lobechat/heterogeneous-agents';
 import { buildTaskManagerDefaultsPrompt, resourcesTreePrompt } from '@lobechat/prompts';
 import type {
   AgentModelOverride,
@@ -70,15 +76,16 @@ import type {
   ScheduleAgentRunParams,
   ScheduleAgentRunResult,
   UserInterventionConfig,
+  WorkingDirConfig,
   WorkspaceInitResult,
 } from '@lobechat/types';
 import {
+  AgentGraphSchema,
   buildHeteroExecArgs,
   ChatErrorType,
   getActivePluginIds,
   getDisabledPluginIds,
   getWorkingDirEffectivePath,
-  ReasoningGraphSchema,
   RequestTrigger,
   resolveAgentAgencyConfig,
   resolveAgentModelConfig,
@@ -99,6 +106,7 @@ import { ChatGroupModel } from '@/database/models/chatGroup';
 import { ConnectorModel } from '@/database/models/connector';
 import { ConnectorToolModel } from '@/database/models/connectorTool';
 import { DeviceModel } from '@/database/models/device';
+import { ExpertiseModel } from '@/database/models/expertise';
 import { FileModel } from '@/database/models/file';
 import { MessageModel } from '@/database/models/message';
 import { PluginModel } from '@/database/models/plugin';
@@ -122,7 +130,10 @@ import { shouldEnableBuiltinSkill } from '@/helpers/skillFilters';
 import { buildConnectorManifests } from '@/libs/mcp/buildConnectorManifests';
 import { patchManifestWithPermissions } from '@/libs/mcp/connectorPermissionCheck';
 import { signOperationJwt, signUserJWT } from '@/libs/trpc/utils/internalJwt';
-import { createStreamEventManager } from '@/server/modules/AgentRuntime/factory';
+import {
+  createAgentStateManager,
+  createStreamEventManager,
+} from '@/server/modules/AgentRuntime/factory';
 import { KeyVaultsGateKeeper } from '@/server/modules/KeyVaultsEncrypt';
 import type { EvalContext, ServerAgentToolsContext } from '@/server/modules/Mecha';
 import { createServerAgentToolsEngine } from '@/server/modules/Mecha';
@@ -187,15 +198,18 @@ import {
 } from './deviceToolRegistry';
 import { ingestAttachment } from './ingestAttachment';
 import { pruneRegeneratedBranch } from './pruneRegeneratedBranch';
-import {
-  resolveDeviceWorkingDirectory,
-  resolveDeviceWorkingDirectoryConfig,
-} from './resolveDeviceWorkingDirectory';
+import { resolveDeviceWorkingDirectoryConfig } from './resolveDeviceWorkingDirectory';
 import { resolveServerSearchDecision } from './searchDecision';
 import { acquireTopicStartReservation } from './topicStartReservation';
 import { isWorkspaceCacheFresh, upsertWorkspaceScan } from './workspaceInitCache';
 
 const log = debug('lobe-server:ai-agent-service');
+
+const supportsCloudHeterogeneousSandbox = (type: HeterogeneousAgentType): boolean =>
+  type === 'claude-code' || type === 'codex';
+
+const getHeterogeneousAgentTitle = (type: HeterogeneousAgentType): string =>
+  getHeterogeneousAgentConfig(type)?.title ?? type;
 
 /**
  * Content written onto a tool row that the user stopped before it ran. Mirrors
@@ -214,9 +228,17 @@ const createGraphAwareAgentFactory =
     }
 
     const runtimeAgentConfig = config.agentConfig as LobeAgentConfig | undefined;
-    const graph = runtimeAgentConfig?.chatConfig?.graph;
-    if (runtimeAgentConfig?.chatConfig?.enableGraphMode && graph) {
-      const graphResult = ReasoningGraphSchema.safeParse(graph);
+    // Graph Agent is an agency-level behavior: read from `agencyConfig`.
+    // Legacy rows stored the graph on `chatConfig` — fall back so existing
+    // agents keep running until their next write migrates them.
+    const agencyConfig = runtimeAgentConfig?.agencyConfig;
+    const legacyChatConfig = runtimeAgentConfig?.chatConfig as
+      (LobeAgentChatConfig & { enableGraphMode?: boolean; graph?: unknown }) | undefined;
+    const graph = agencyConfig?.graph ?? legacyChatConfig?.graph;
+    const graphEnabled =
+      (agencyConfig?.enableGraphMode ?? legacyChatConfig?.enableGraphMode) === true;
+    if (graphEnabled && graph) {
+      const graphResult = AgentGraphSchema.safeParse(graph);
 
       if (graphResult.success) {
         return new GraphAgent({ ...config, graph: graphResult.data });
@@ -503,6 +525,15 @@ interface InternalExecAgentParams extends ExecAgentParams {
    */
   title?: string;
   /**
+   * Force the effective `chatConfig.toolMode` for this run. Set by IM bot
+   * conversations where the user explicitly switched mode via `/mode` —
+   * an explicit per-conversation choice, so it wins over the agent's own
+   * chatConfig AND workspace member-mode overrides.
+   */
+  toolModeOverride?: 'agent' | 'chat';
+  /** Running operation that owns the topic for an internally spawned child run. */
+  topicStartOwnerOperationId?: string;
+  /**
    * Re-enter a topic-start reservation already acquired by an upstream caller,
    * such as TaskResultBridgeService.
    */
@@ -529,6 +560,18 @@ interface InternalExecAgentParams extends ExecAgentParams {
  */
 interface ResolvedWorkspaceInit {
   boundCwd?: string;
+  /**
+   * The full config behind {@link boundCwd} (source path + repoType + the
+   * active worktree). Callers persist THIS onto the topic, not the flat path:
+   * project grouping keys off `config.path` (the source repo), so a run inside
+   * a linked worktree must still file under its repo.
+   */
+  boundCwdConfig?: WorkingDirConfig;
+  /**
+   * The cwd the topic was ALREADY pinned to, so a caller can tell a first-time
+   * binding from a no-op rewrite without re-reading the topic row.
+   */
+  topicWorkingDirectory?: string;
   workspace: WorkspaceInitResult;
 }
 
@@ -786,7 +829,7 @@ export class AiAgentService {
     // 3. The operation never started — drop the running marker so reconnect /
     //    heteroIngest validation and the next turn don't see a stale operation.
     try {
-      await this.topicModel.updateMetadata(topicId, { runningOperation: null });
+      await this.topicModel.takeRunningOperation(topicId, operationId);
     } catch (err) {
       log('finalizeHeteroDispatchError: clear runningOperation failed (non-fatal): %O', err);
     }
@@ -838,14 +881,17 @@ export class AiAgentService {
       // caller so the system prompt's {{workingDirectory}} reflects the same
       // bound directory the workspace scan used.
       const topic = await this.topicModel.findById(topicId);
-      const boundCwd = resolveDeviceWorkingDirectory({
+      const topicWorkingDirectory = topic?.metadata?.workingDirectory;
+      const boundCwdConfig = resolveDeviceWorkingDirectoryConfig({
         deviceDefaultCwd: device.defaultCwd,
         deviceId: activeDeviceId,
-        topicWorkingDirectory: topic?.metadata?.workingDirectory,
+        topicWorkingDirectory,
         topicWorkingDirectoryConfig: topic?.metadata?.workingDirectoryConfig,
         workingDirByDevice: agencyConfig?.workingDirByDevice,
       });
+      const boundCwd = getWorkingDirEffectivePath(boundCwdConfig);
       if (!boundCwd) return { workspace: empty };
+      const resolved = { boundCwd, boundCwdConfig, topicWorkingDirectory };
 
       const workingDirs = device.workingDirs ?? [];
       const cached = workingDirs.find(
@@ -854,7 +900,7 @@ export class AiAgentService {
 
       if (isWorkspaceCacheFresh(cached, Date.now()) && cached?.workspace) {
         log('execAgent: reusing cached workspace init for %s', boundCwd);
-        return { boundCwd, workspace: cached.workspace };
+        return { ...resolved, workspace: cached.workspace };
       }
 
       const scanned = await deviceGateway.initWorkspace({
@@ -868,9 +914,9 @@ export class AiAgentService {
         // cache rather than dropping the project's skills + instructions.
         if (cached?.workspace) {
           log('execAgent: workspace init scan failed, using stale cache for %s', boundCwd);
-          return { boundCwd, workspace: cached.workspace };
+          return { ...resolved, workspace: cached.workspace };
         }
-        return { boundCwd, workspace: empty };
+        return { ...resolved, workspace: empty };
       }
 
       // Persist the fresh scan back onto `workingDirs` (update in place or prepend
@@ -897,10 +943,48 @@ export class AiAgentService {
       }
       log('execAgent: scanned and cached workspace init for %s', boundCwd);
 
-      return { boundCwd, workspace: scanned };
+      return { ...resolved, workspace: scanned };
     } catch (error) {
       log('execAgent: resolveWorkspaceInit failed: %O', error);
       return { workspace: empty };
+    }
+  }
+
+  /**
+   * Pin a topic to the directory its run actually executes in.
+   *
+   * A topic created by a device-bound run starts with no cwd of its own: the
+   * directory was only ever recorded at agent level
+   * (`agencyConfig.workingDirByDevice`) or on the device (`defaultCwd`). Without
+   * this write the topic stays unbound — By-Project grouping files it under "No
+   * directory", and every later turn re-resolves from the agent config, so
+   * changing the agent's directory silently moves an old conversation to a new
+   * project (and makes hetero `--resume` unsafe).
+   *
+   * Shared by BOTH execution paths — hetero device dispatch and the normal
+   * agent runtime — so a native agent bound to a device gets the same binding a
+   * CLI agent does. Purely additive: a topic that already carries a cwd (the
+   * client resolved one and sent it as `initialTopicMetadata`, or an earlier
+   * turn bound it) is never rewritten, so the historical pin always wins.
+   */
+  private async bindTopicWorkingDirectory(params: {
+    config?: WorkingDirConfig;
+    currentWorkingDirectory?: string;
+    topicId: string;
+  }): Promise<void> {
+    const { config, currentWorkingDirectory, topicId } = params;
+    if (currentWorkingDirectory || !config) return;
+    const path = getWorkingDirEffectivePath(config);
+    if (!path) return;
+
+    try {
+      await this.topicModel.updateMetadata(topicId, {
+        workingDirectory: path,
+        workingDirectoryConfig: config,
+      });
+    } catch (err) {
+      // Metadata bookkeeping must never fail a run that is otherwise fine.
+      log('execAgent: bindTopicWorkingDirectory failed (non-fatal): %O', err);
     }
   }
 
@@ -1244,10 +1328,14 @@ export class AiAgentService {
     // advance the topic's main spine. They may start while their parent
     // operation owns `runningOperation` (for example callAgent/callSubAgent),
     // so making them wait for the topic-start claim deadlocks the child start.
-    if (!topicId || params.appContext?.threadId) return this.execAgentWithReservation(params);
+    if (!topicId || params.appContext?.threadId) {
+      return this.execAgentWithReservation(params);
+    }
 
     const reservationId = params.topicStartReservationId ?? `agent-start-${nanoid()}`;
     const reserved = await acquireTopicStartReservation({
+      replacesOperationId: params.replacesOperationId,
+      allowRunningOperationId: params.topicStartOwnerOperationId,
       reservationId,
       topicId,
       topicModel: this.topicModel,
@@ -1288,6 +1376,7 @@ export class AiAgentService {
       hooks,
       instructions,
       chatConfigOverride,
+      toolModeOverride,
       model: modelOverride,
       provider: providerOverride,
       stream,
@@ -1457,6 +1546,27 @@ export class AiAgentService {
       // the merged chatConfig alone can't distinguish them from stale agent
       // values, which the reasoning-config migration ignores.
       agentConfig.subAgentChatConfigOverride = chatConfigOverride;
+    }
+
+    // Explicit per-conversation mode switch (IM `/mode` command). Applied last
+    // so it wins over the agent's own chatConfig, workspace member-mode
+    // overrides, and sub-agent chatConfig patches alike. `enableAgentMode` is
+    // kept in sync because the context engine gates agentic-only injectors
+    // (skill discovery, agent documents, agent-management context) on it, not
+    // on `toolMode` — otherwise `/mode chat` would keep agentic context while
+    // `/mode agent` on a chat-default agent would run tools without it.
+    if (toolModeOverride) {
+      // `custom` is agent-side (the `/mode` picker reports it as Agent Mode)
+      // but means "exactly the agent's declared plugins". Returning to Agent
+      // Mode must restore that hand-picked set, not widen it to the full
+      // default toolset by overwriting `custom` with `agent`.
+      const storedToolMode = agentConfig.chatConfig?.toolMode;
+      agentConfig.chatConfig = {
+        ...agentConfig.chatConfig,
+        enableAgentMode: toolModeOverride === 'agent',
+        toolMode:
+          toolModeOverride === 'agent' && storedToolMode === 'custom' ? 'custom' : toolModeOverride,
+      };
     }
 
     // Persistence-attribution agent id. Background Agent Signal runs (memory /
@@ -1884,7 +1994,6 @@ export class AiAgentService {
 
     // 3. Handle topic creation: if no topicId provided, create a new topic; otherwise reuse existing
     let topicId = appContext?.topicId;
-    const isNewTopic = !topicId;
     const isFixedExecutionTargetSelection =
       !!this.workspaceId && agentConfig.agencyConfig?.executionTargetSelectionPolicy === 'fixed';
     const isFixedDeviceTarget =
@@ -1948,6 +2057,16 @@ export class AiAgentService {
           : undefined;
 
       const fallbackTitleSource = markdownToTxt(prompt);
+      // A heterogeneous agent has no chat model to snapshot: the external CLI
+      // owns model selection, so `model` here is a stale agent default and
+      // `provider` is NULL (defaulted to the platform chat provider) on every
+      // agent created before the runtime type was stamped on the agent row.
+      // Pin the runtime type and leave the model to the per-run backfill — the
+      // same rule the assistant placeholder below and the client's
+      // `snapshotAgentModel` follow. Detection mirrors the hetero early exit.
+      const heteroSnapshotType =
+        agentConfig.agencyConfig?.heterogeneousProvider?.type ??
+        (isHeterogeneousAgentModelId(model) ? model : undefined);
       // Second argument: the id the client already rendered this topic under
       // (sidebar row, message bucket). Absent → the model mints one as before.
       const newTopic = await this.topicModel.create(
@@ -1963,8 +2082,8 @@ export class AiAgentService {
           groupId: appContext?.groupId,
           metadata,
           // Snapshot the effective model as the topic's pinned model (config).
-          model,
-          provider,
+          model: heteroSnapshotType ? undefined : model,
+          provider: heteroSnapshotType ?? provider,
           title:
             title !== undefined
               ? title
@@ -2025,7 +2144,8 @@ export class AiAgentService {
     // 3.5. Hetero-agent early exit — local CLI and remote platform agents bypass the
     // server-side LLM pipeline.  After topic + message creation we hand off to
     // the device gateway (desktop) or cloud sandbox, which will push events
-    // back via `heteroIngest` / `heteroFinish` (amp / claude-code / codex / opencode / pi / qoder) or
+    // back via `heteroIngest` / `heteroFinish` (amp / claude-code / codebuddy /
+    // codex / cursor / kimi-code / opencode / pi / qoder) or
     // `agentNotify.notify` (openclaw / hermes).
     //
     // Detection: prefer agencyConfig.heterogeneousProvider.type (set by the UI),
@@ -2284,13 +2404,12 @@ export class AiAgentService {
         log('execAgent: failed to resolve GitHub token: %O', err);
       }
 
-      // When resuming, inject the recent conversation turns as context so CC can
-      // orient itself even if the native session file was cleared (sandbox recycled
-      // or context overflow caused the CLI to start a fresh session).
-      // Only fetch when there IS a stored session id — for first-turn runs CC has
-      // no prior history to inject.
+      // Recovery history is reserved for the CLI's retry without native resume.
+      // The primary resumed attempt already has native history and must not get
+      // a serialized duplicate. Amp threads are server-backed, so they rely on
+      // native continuation exclusively and never need this local-file fallback.
       let conversationHistory: ConversationHistoryEntry[] | undefined;
-      if (resumeSessionId) {
+      if (resumeSessionId && heteroType !== 'amp') {
         try {
           const recentMsgs = await this.messageModel.query({ topicId, pageSize: 200 });
           const turns = recentMsgs
@@ -2298,6 +2417,7 @@ export class AiAgentService {
               (m) =>
                 (m.role === 'user' || m.role === 'assistant') &&
                 !m.threadId &&
+                !selfMessageIds.has(m.id) &&
                 m.content &&
                 m.content !== LOADING_FLAT,
             )
@@ -2312,13 +2432,22 @@ export class AiAgentService {
         }
       }
 
-      // Build cloud-specific system context (repo list + workspace info + optional agent-level static context).
+      // Build the primary context without conversation history. If native resume
+      // fails, the CLI switches to the complete fallback prompt on its fresh
+      // retry; successful same-session runs never consume the duplicate history.
       const systemContext = buildCloudHeteroContext({
         agentSystemContext: agentConfig.agencyConfig?.heterogeneousProvider?.systemContext,
-        conversationHistory,
         githubToken,
         repos: topicRepos,
       });
+      const resumeFallbackSystemContext = conversationHistory
+        ? buildCloudHeteroContext({
+            agentSystemContext: agentConfig.agencyConfig?.heterogeneousProvider?.systemContext,
+            conversationHistory,
+            githubToken,
+            repos: topicRepos,
+          })
+        : undefined;
 
       // Feed the resolved images (signed URLs) to the dispatched CLI for vision —
       // mirrors the local-mode path, where the client feeds the persisted
@@ -2328,19 +2457,13 @@ export class AiAgentService {
         runAttachments.imageList && runAttachments.imageList.length > 0
           ? runAttachments.imageList.map((image) => ({ id: image.id, url: image.url }))
           : undefined;
-      const heteroExecArgs =
-        heteroType === 'amp' ||
-        heteroType === 'claude-code' ||
-        heteroType === 'codex' ||
-        heteroType === 'opencode' ||
-        heteroType === 'pi' ||
-        heteroType === 'qoder'
-          ? buildHeteroExecArgs(
-              agentConfig.agencyConfig?.heterogeneousProvider?.type === heteroType
-                ? agentConfig.agencyConfig.heterogeneousProvider
-                : { type: heteroType },
-            )
-          : undefined;
+      const heteroExecArgs = isLocalHeterogeneousType(heteroType)
+        ? buildHeteroExecArgs(
+            agentConfig.agencyConfig?.heterogeneousProvider?.type === heteroType
+              ? agentConfig.agencyConfig.heterogeneousProvider
+              : { type: heteroType },
+          )
+        : undefined;
 
       const heteroParams = {
         agentType: heteroType,
@@ -2351,6 +2474,7 @@ export class AiAgentService {
         operationId,
         prompt,
         repos: topicRepos,
+        resumeFallbackSystemContext,
         resumeSessionId,
         systemContext,
         topicId,
@@ -2402,24 +2526,99 @@ export class AiAgentService {
       // operation, and so every terminal site (heteroFinish, agentNotify done,
       // dispatch failure) can re-fire the serialized hooks across a process
       // boundary in queue mode.
-      await this.topicModel.updateMetadata(topicId, {
-        runningOperation: {
+      const childOperation = {
+        assistantMessageId: assistantMessageRecord.id,
+        hooks: serializedHooks,
+        ...(isRemoteHetero && remoteDeviceId
+          ? {
+              deviceId: remoteDeviceId,
+              deviceUserId: remoteDeviceUserId,
+              deviceWorkspaceId: remoteDeviceWorkspaceId,
+              heteroType,
+            }
+          : {}),
+        operationId,
+        orchestrationRole: appContext?.orchestrationRole,
+        scope: appContext?.scope ?? undefined,
+        threadId: appContext?.threadId ?? undefined,
+      };
+      if (params.topicStartOwnerOperationId) {
+        const attached = await this.topicModel.appendRunningOperationChild(
+          topicId,
+          params.topicStartOwnerOperationId,
+          childOperation,
+        );
+        if (!attached) {
+          const message = 'Group supervisor finished before this member could start.';
+          await new CompletionLifecycle(this.db, this.userId, this.workspaceId).completeOperation(
+            {
+              agentId: persistAgentId,
+              assistantMessageId: assistantMessageRecord.id,
+              error: { message, type: 'AgentRuntimeError' },
+              operationId,
+              orchestrationRole: appContext?.orchestrationRole,
+              serializedHooks,
+              topicId,
+              userId: this.userId,
+            },
+            'error',
+          );
+          return {
+            agentId: resolvedAgentId,
+            assistantMessageId: assistantMessageRecord.id,
+            autoStarted: false,
+            createdAt: new Date().toISOString(),
+            error: message,
+            message,
+            operationId,
+            status: 'error',
+            success: false,
+            timestamp: new Date().toISOString(),
+            topicId,
+            userMessageId: userMessageRecord?.id ?? parentMessageId ?? '',
+          };
+        }
+      } else {
+        await this.topicModel.updateMetadata(topicId, { runningOperation: childOperation });
+      }
+
+      const persistMirrorTarget = async () => {
+        if (!params.topicStartOwnerOperationId) return;
+        try {
+          await createAgentStateManager().createOperationMetadata(operationId, {
+            mirrorToOperationId: params.topicStartOwnerOperationId,
+            userId: this.userId,
+            workspaceId: this.workspaceId,
+          });
+        } catch (err) {
+          log('execAgent: failed to persist hetero mirror target: %O', err);
+        }
+      };
+
+      if (agentConfig.agencyConfig?.heterogeneousProvider?.authMode === 'api') {
+        await this.finalizeHeteroDispatchError({
+          agentId: resolvedAgentId,
           assistantMessageId: assistantMessageRecord.id,
-          hooks: serializedHooks,
-          // Store deviceId + heteroType so interruptTask can cancel remote processes
-          ...(isRemoteHetero && remoteDeviceId
-            ? {
-                deviceId: remoteDeviceId,
-                deviceUserId: remoteDeviceUserId,
-                deviceWorkspaceId: remoteDeviceWorkspaceId,
-                heteroType,
-              }
-            : undefined),
+          detail: HETEROGENEOUS_PROVIDER_BINDING_LOCAL_ONLY_ERROR,
+          message: 'Provider-bound heterogeneous agents do not support this execution target',
           operationId,
-          scope: appContext?.scope ?? undefined,
-          threadId: appContext?.threadId ?? undefined,
-        },
-      });
+          topicId,
+        });
+        return {
+          agentId: resolvedAgentId,
+          assistantMessageId: assistantMessageRecord.id,
+          autoStarted: false,
+          createdAt: new Date().toISOString(),
+          error: HETEROGENEOUS_PROVIDER_BINDING_LOCAL_ONLY_ERROR,
+          message: 'Heterogeneous agent provider binding requires Desktop local execution',
+          operationId,
+          status: 'error',
+          success: false,
+          timestamp: new Date().toISOString(),
+          topicId,
+          userMessageId: userMessageRecord?.id ?? parentMessageId ?? '',
+        };
+      }
 
       // Notify-based platform agents (openclaw / hermes) communicate back via
       // agentNotify.notify. A local run uses the requesting desktop's device ID;
@@ -2486,12 +2685,14 @@ export class AiAgentService {
 
         // Open the stream channel so the gateway WS subscription can receive
         // notify_update events published by agentNotify.notify.
+        await persistMirrorTarget();
         const streamManager = createStreamEventManager();
         await streamManager
           .publishAgentRuntimeInit(operationId, {
             agentId: resolvedAgentId,
             assistantMessageId: assistantMessageRecord.id,
             heteroType,
+            mirrorToOperationId: params.topicStartOwnerOperationId,
             topicId,
             userId: this.userId,
           })
@@ -2512,6 +2713,7 @@ export class AiAgentService {
               agentType: heteroType,
               cwd: undefined,
               operationId,
+              parentOperationId: params.topicStartOwnerOperationId,
               platformAgentId: agentConfig.agencyConfig?.heterogeneousProvider?.platformAgentId,
               prompt,
               taskId: operationId,
@@ -2553,8 +2755,9 @@ export class AiAgentService {
           };
         }
       } else {
-        // Local CLI hetero (Amp / Claude Code / Codex / OpenCode / Pi) — fork between device dispatch
-        // and cloud sandbox via the shared execution plan:
+        // Local CLI hetero (Amp / Claude Code / Codex / Kimi Code / OpenCode /
+        // Pi / Qoder) — fork between device dispatch and cloud sandbox via the
+        // shared execution plan:
         //   - requestedDeviceId (topic-level override) always wins
         //   - executionTarget 'device' → dispatch to boundDeviceId (errors if unset)
         //   - executionTarget 'local' + boundDeviceId (desktop sync opened on web)
@@ -2585,10 +2788,12 @@ export class AiAgentService {
         // the init only powers reconnect, not the run. `createStreamEventManager`
         // probes Redis synchronously, so guard construction too, not just publish.
         try {
+          await persistMirrorTarget();
           await createStreamEventManager().publishAgentRuntimeInit(operationId, {
             agentId: resolvedAgentId,
             assistantMessageId: assistantMessageRecord.id,
             heteroType,
+            mirrorToOperationId: params.topicStartOwnerOperationId,
             topicId,
             userId: this.userId,
           });
@@ -2602,7 +2807,7 @@ export class AiAgentService {
           isHetero: true,
           clientExecutionAvailable: false,
           requestedDeviceId,
-          sandboxExecutionAvailable: heteroType === 'claude-code' || heteroType === 'codex',
+          sandboxExecutionAvailable: supportsCloudHeterogeneousSandbox(heteroType),
           trigger: requestTriggerMetadata?.trigger,
         });
 
@@ -2613,13 +2818,9 @@ export class AiAgentService {
             await this.finalizeHeteroDispatchError({
               agentId: resolvedAgentId,
               assistantMessageId: assistantMessageRecord.id,
-              detail:
-                heteroType === 'amp' ||
-                heteroType === 'opencode' ||
-                heteroType === 'pi' ||
-                heteroType === 'qoder'
-                  ? 'No device bound. Pick a local or connected device in the Execution Device switcher.'
-                  : 'No device bound. Pick a device in the Execution Device switcher, or switch to Cloud sandbox.',
+              detail: !supportsCloudHeterogeneousSandbox(heteroType)
+                ? 'No device bound. Pick a local or connected device in the Execution Device switcher.'
+                : 'No device bound. Pick a device in the Execution Device switcher, or switch to Cloud sandbox.',
               message: 'No bound device for hetero agent',
               operationId,
               topicId,
@@ -2663,38 +2864,43 @@ export class AiAgentService {
           });
           const deviceCwd = getWorkingDirEffectivePath(deviceCwdConfig);
 
-          // A brand-new topic has no pinned cwd yet: the directory was only
+          // An unbound topic has no pinned cwd yet: the directory was only
           // recorded at agent level (`workingDirByDevice`) when no topic existed.
           // Persist the resolved cwd onto the topic so the sidebar groups it
           // under the right project and the next turn reuses the same directory.
-          if (isNewTopic && deviceCwd && deviceCwd !== topic?.metadata?.workingDirectory) {
-            await this.topicModel.updateMetadata(topicId, {
-              workingDirectory: deviceCwd,
-              ...(deviceCwdConfig ? { workingDirectoryConfig: deviceCwdConfig } : {}),
-            });
-          }
+          await this.bindTopicWorkingDirectory({
+            config: deviceCwdConfig,
+            currentWorkingDirectory: topic?.metadata?.workingDirectory,
+            topicId,
+          });
 
-          // A device is the user's own persistent machine — build a
-          // device-specific context instead of reusing the cloud-sandbox one
-          // (which describes an ephemeral /workspace + pre-cloned repos and
-          // would mislead the agent).
+          // Build only device-relevant context instead of reusing the cloud-sandbox one
+          // (which describes an ephemeral /workspace + pre-cloned repos and would mislead
+          // the agent). The spawned CLI already receives deviceCwd as its actual cwd.
           const deviceSystemContext = buildRemoteDeviceHeteroContext({
             agentSystemContext: agentConfig.agencyConfig?.heterogeneousProvider?.systemContext,
-            conversationHistory,
-            // The native CLI session already knows its cwd. Keep the explanatory workspace note
-            // on the first turn only so persistent resumed sessions do not accumulate duplicates.
-            cwd: resumeSessionId ? undefined : deviceCwd,
           });
+          const deviceResumeFallbackSystemContext = conversationHistory
+            ? buildRemoteDeviceHeteroContext({
+                agentSystemContext: agentConfig.agencyConfig?.heterogeneousProvider?.systemContext,
+                conversationHistory,
+              })
+            : undefined;
 
           const result = await deviceGateway.dispatchAgentRun({
             ...heteroParams,
             args: heteroExecArgs,
             cwd: deviceCwd,
             deviceId: dispatchDeviceId,
+            resumeFallbackSystemContext: deviceResumeFallbackSystemContext,
             systemContext: deviceSystemContext,
             // Route to the workspace pool when this is a workspace device; the
             // operation JWT stays member-scoped (the run belongs to the member).
             workspaceId: dispatchWorkspaceId,
+            // Topic scope for device-side heteroIngest/heteroFinish. Distinct
+            // from the routing workspace above: a workspace topic on a personal
+            // device still has to write back under `this.workspaceId`.
+            ingestWorkspaceId: this.workspaceId,
           });
           if (!result.success) {
             log('execAgent: hetero device dispatch failed: %s', result.error);
@@ -2723,8 +2929,8 @@ export class AiAgentService {
             };
           }
         } else {
-          if (heteroType === 'amp' || heteroType === 'opencode') {
-            const message = `${heteroType === 'amp' ? 'Amp' : 'OpenCode'} requires a local or connected device; cloud sandbox execution is not supported.`;
+          if (!supportsCloudHeterogeneousSandbox(heteroType)) {
+            const message = `${getHeterogeneousAgentTitle(heteroType)} requires a local or connected device; cloud sandbox execution is not supported.`;
             await this.finalizeHeteroDispatchError({
               agentId: resolvedAgentId,
               assistantMessageId: assistantMessageRecord.id,
@@ -2773,6 +2979,7 @@ export class AiAgentService {
             args: heteroExecArgs,
             jwt: sandboxJwt,
             marketService,
+            workspaceId: this.workspaceId,
           }).catch(async (err) => {
             // Fire-and-forget: execAgent has already returned `autoStarted`, and
             // the sandbox never reached the point of calling heteroFinish. Drive
@@ -2822,6 +3029,7 @@ export class AiAgentService {
     // Agent-level memory config takes priority; fallback to user-level setting
     const agentMemoryEnabled = agentConfig.chatConfig?.memory?.enabled;
     let globalMemoryEnabled = agentMemoryEnabled ?? false;
+    let enableExpertise = false;
     let userTimezone: string | undefined;
     // Resolved once below (alongside the group-tool authorization fetch) and
     // forwarded into op metadata for the per-step context engine.
@@ -2837,6 +3045,12 @@ export class AiAgentService {
       userTimezone = generalSettings?.timezone;
     } catch (error) {
       log('execAgent: failed to fetch user settings: %O', error);
+    }
+    try {
+      const preference = await new UserModel(this.db, this.userId).getUserPreference();
+      enableExpertise = preference?.lab?.enableSelfLearning === true;
+    } catch (error) {
+      console.error('Failed to resolve expertise injection Lab preference:', error);
     }
     log(
       'execAgent: globalMemoryEnabled=%s, timezone=%s',
@@ -4081,6 +4295,38 @@ export class AiAgentService {
     const timestamp = Date.now();
     const operationId = `op_${timestamp}_${resolvedAgentId}_${topicId}_${nanoid(8)}`;
 
+    if (params.topicStartOwnerOperationId) {
+      const attached = await this.topicModel.appendRunningOperationChild(
+        topicId,
+        params.topicStartOwnerOperationId,
+        {
+          assistantMessageId: assistantMessageRecord.id,
+          operationId,
+          orchestrationRole: appContext?.orchestrationRole,
+          scope: appContext?.scope ?? undefined,
+          threadId: appContext?.threadId ?? undefined,
+        },
+      );
+      if (!attached) {
+        const errorMessage = 'Group supervisor finished before this member could start.';
+        await updateAbortedAssistantMessage(errorMessage);
+        return {
+          agentId: resolvedAgentId,
+          assistantMessageId: assistantMessageRecord.id,
+          autoStarted: false,
+          createdAt: new Date().toISOString(),
+          error: errorMessage,
+          message: errorMessage,
+          operationId,
+          status: 'error',
+          success: false,
+          timestamp: new Date().toISOString(),
+          topicId,
+          userMessageId: userMessageRecord?.id ?? parentMessageId ?? '',
+        };
+      }
+    }
+
     // 16. Create initial context
     let initialContext: AgentRuntimeContext = {
       payload: {
@@ -4293,6 +4539,41 @@ export class AiAgentService {
       Object.keys(toolManifestMap).length,
     );
 
+    // Project skills + the root AGENTS.md are discovered server-side by
+    // scanning the device's bound project directory ("workspace init"), cached
+    // on `devices.workingDirs` and reused within the TTL. Skills surface in
+    // `<available_skills>` (metadata only — SKILL.md bodies are read lazily at
+    // activation via `local-system` readFile, which `serverRuntimes/skills.ts`
+    // re-gates on `activeDeviceId`). Only `location` (the absolute SKILL.md
+    // path) flows through; the directory tree is enumerated lazily, keeping the
+    // op-param payload small.
+    const workspaceInit = await this.resolveWorkspaceInit({
+      activeDeviceId,
+      agencyConfig: agentConfig.agencyConfig ?? undefined,
+      topicId,
+    });
+
+    // Feed the bound directory (resolved from the persisted device row) into
+    // the local-system tool's {{workingDirectory}} placeholder — the channel
+    // the model uses to know where it is and reach for absolute paths — and,
+    // downstream, the runCommand cwd / search scope (RuntimeExecutors reads
+    // state.metadata.deviceSystemInfo.workingDirectory). Resume-safe via the
+    // existing deviceSystemInfo plumbing (computeDeviceContext).
+    if (workspaceInit.boundCwd) {
+      deviceSystemInfo.workingDirectory = workspaceInit.boundCwd;
+    }
+
+    // Bind the topic to that very directory. A native (non-hetero) agent
+    // routed to a device used to resolve its cwd here for the prompt and the
+    // tools, but never write it back — so its topics stayed unbound while the
+    // run itself executed in the right place. Awaited (not fire-and-forget):
+    // the tool layer reads the topic's cwd on the same run.
+    await this.bindTopicWorkingDirectory({
+      config: workspaceInit.boundCwdConfig,
+      currentWorkingDirectory: workspaceInit.topicWorkingDirectory,
+      topicId,
+    });
+
     // 18. Build OperationSkillSet via SkillEngine
     // Combines builtin skills + user DB skills + agent-document skill bundles,
     // filters by platform via enableChecker, and pairs with agent's enabled
@@ -4358,30 +4639,6 @@ export class AiAgentService {
         identifier: skill.identifier,
         name: skill.name,
       }));
-
-      // Project skills + the root AGENTS.md are discovered server-side by
-      // scanning the device's bound project directory ("workspace init"), cached
-      // on `devices.workingDirs` and reused within the TTL. Skills surface in
-      // `<available_skills>` (metadata only — SKILL.md bodies are read lazily at
-      // activation via `local-system` readFile, which `serverRuntimes/skills.ts`
-      // re-gates on `activeDeviceId`). Only `location` (the absolute SKILL.md
-      // path) flows through; the directory tree is enumerated lazily, keeping the
-      // op-param payload small.
-      const workspaceInit = await this.resolveWorkspaceInit({
-        activeDeviceId,
-        agencyConfig: agentConfig.agencyConfig ?? undefined,
-        topicId,
-      });
-
-      // Feed the bound directory (resolved from the persisted device row) into
-      // the local-system tool's {{workingDirectory}} placeholder — the channel
-      // the model uses to know where it is and reach for absolute paths — and,
-      // downstream, the runCommand cwd / search scope (RuntimeExecutors reads
-      // state.metadata.deviceSystemInfo.workingDirectory). Resume-safe via the
-      // existing deviceSystemInfo plumbing (computeDeviceContext).
-      if (workspaceInit.boundCwd) {
-        deviceSystemInfo.workingDirectory = workspaceInit.boundCwd;
-      }
 
       const projectMetas = workspaceInit.workspace.skills.map((s) => ({
         description: s.description ?? '',
@@ -4460,6 +4717,17 @@ export class AiAgentService {
       operationSkillSet = skillEngine.generate(agentPlugins ?? []);
     } catch (error) {
       log('execAgent: failed to build operationSkillSet: %O', error);
+    }
+
+    // Resolve learned expertise once so every step in this operation uses the exact same snapshot.
+    // ContextEngine owns the Lab-controlled injection decision via enableExpertise.
+    const expertiseAgentId = appContext?.agentSignal?.agentId ?? resolvedAgentId;
+    let expertise;
+    try {
+      const expertiseModel = new ExpertiseModel(this.db, this.userId, this.workspaceId);
+      expertise = await buildExpertiseContextSnapshot(expertiseModel, expertiseAgentId);
+    } catch (error) {
+      console.error('Failed to build expertise snapshot for agent:', expertiseAgentId, error);
     }
 
     // 19. Create operation using AgentRuntimeService
@@ -4541,6 +4809,8 @@ export class AiAgentService {
         deviceAccessPolicy: { canUseDevice, reason: deviceAccessReason },
         discordContext,
         evalContext,
+        enableExpertise,
+        expertise,
         initialContext,
         initialMessages: allMessages,
         initialStepCount,
@@ -4580,7 +4850,9 @@ export class AiAgentService {
       // WebSocket for the rest of the run. The parent's mark stays authoritative;
       // a child's live progress already rides down the parent channel via
       // `appContext.subAgentProgress`.
-      if (!appContext?.isolationThread) {
+      // `orchestrationRole` is public rendering metadata. Only the internally
+      // propagated parent operation id proves child ownership of this topic.
+      if (!appContext?.isolationThread && !params.topicStartOwnerOperationId) {
         await this.topicModel.updateMetadata(topicId, {
           runningOperation: {
             assistantMessageId: assistantMessageRecord.id,
@@ -4617,6 +4889,9 @@ export class AiAgentService {
         userMessageId: userMessageRecord?.id ?? parentMessageId ?? '',
       };
     } catch (error) {
+      if (params.topicStartOwnerOperationId) {
+        await this.topicModel.removeRunningOperationChild(topicId, operationId).catch(() => false);
+      }
       if (isAbortError(error)) {
         await updateAbortedAssistantMessage(error.message);
         log('execAgent: createOperation aborted for %s: %s', operationId, error.message);
@@ -4940,6 +5215,7 @@ export class AiAgentService {
       parentOperationId,
       prompt: speakerInstruction,
       suppressUserMessage: true,
+      topicStartOwnerOperationId: parentOperationId,
       trigger: inheritedTrigger,
       userInterventionConfig: { approvalMode: 'headless' },
     });
@@ -5621,29 +5897,40 @@ export class AiAgentService {
             deviceWorkspaceId?: string;
             heteroType?: string;
             operationId?: string;
+            childOperations?: Array<{
+              deviceId?: string;
+              deviceUserId?: string;
+              deviceWorkspaceId?: string;
+              heteroType?: string;
+              operationId?: string;
+            }>;
           }
         | undefined;
+      const targetOperation =
+        runningOp?.operationId === resolvedOperationId
+          ? runningOp
+          : runningOp?.childOperations?.find((child) => child.operationId === resolvedOperationId);
 
       if (
-        runningOp?.deviceId &&
-        runningOp.heteroType &&
-        runningOp.operationId === resolvedOperationId &&
-        isRemoteHeterogeneousType(runningOp.heteroType)
+        targetOperation?.deviceId &&
+        targetOperation.heteroType &&
+        isRemoteHeterogeneousType(targetOperation.heteroType)
       ) {
-        const taskId = runningOp.operationId ?? resolvedOperationId;
+        const taskId = targetOperation.operationId ?? resolvedOperationId;
         log(
           'interruptTask: cancelling remote hetero process heteroType=%s deviceId=%s taskId=%s',
-          runningOp.heteroType,
-          runningOp.deviceId,
+          targetOperation.heteroType,
+          targetOperation.deviceId,
           taskId,
         );
         const cancelWorkspaceId =
-          runningOp.deviceWorkspaceId ?? (await this.resolveDeviceWorkspaceId(runningOp.deviceId));
+          targetOperation.deviceWorkspaceId ??
+          (await this.resolveDeviceWorkspaceId(targetOperation.deviceId));
         await deviceGateway
           .executeToolCall(
             {
-              deviceId: runningOp.deviceId,
-              userId: runningOp.deviceUserId ?? this.userId,
+              deviceId: targetOperation.deviceId,
+              userId: targetOperation.deviceUserId ?? this.userId,
               workspaceId: cancelWorkspaceId,
             },
             {

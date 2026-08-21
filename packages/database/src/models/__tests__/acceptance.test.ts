@@ -5,6 +5,7 @@ import { getTestDB } from '../../core/getTestDB';
 import { acceptances, topics, users, verifyRuns, workspaces } from '../../schemas';
 import type { LobeChatDatabase } from '../../type';
 import { AcceptanceModel } from '../acceptance';
+import { ProjectModel } from '../project';
 import { VerifyRunModel } from '../verifyRun';
 
 const serverDB: LobeChatDatabase = await getTestDB();
@@ -67,6 +68,42 @@ describe('AcceptanceModel', () => {
     expect(third.requirement).toBe('Review UX polish ships end to end');
   });
 
+  it('stores the project on the acceptance and becomes ungrouped when it is deleted', async () => {
+    const projectModel = new ProjectModel(serverDB, userId);
+    const project = await projectModel.create({ identifier: 'ACPT', name: 'Acceptance project' });
+    const model = new AcceptanceModel(serverDB, userId);
+
+    const first = await model.ensureForSubject('topic', topicId);
+    expect(first.projectId).toBeNull();
+
+    const grouped = await model.ensureForSubject('topic', topicId, { projectId: project.id });
+    expect(grouped.projectId).toBe(project.id);
+    expect((await model.findById(grouped.id))?.projectId).toBe(project.id);
+
+    await projectModel.delete(project.id);
+    expect((await model.findById(grouped.id))?.projectId).toBeNull();
+  });
+
+  it('files an acceptance under a project and takes it back out', async () => {
+    const projectModel = new ProjectModel(serverDB, userId);
+    const project = await projectModel.create({ identifier: 'MOVE', name: 'Move target' });
+    const model = new AcceptanceModel(serverDB, userId);
+    const acceptance = await model.ensureForSubject('topic', topicId);
+
+    await model.update(acceptance.id, { projectId: project.id });
+    expect((await model.findById(acceptance.id))?.projectId).toBe(project.id);
+
+    // Ungrouping is the same write with a null — the aggregate itself stays put.
+    await model.update(acceptance.id, { projectId: null });
+    expect((await model.findById(acceptance.id))?.projectId).toBeNull();
+
+    // Another user's model cannot re-file it: ownership scopes the update.
+    await new AcceptanceModel(serverDB, otherUserId).update(acceptance.id, {
+      projectId: project.id,
+    });
+    expect((await model.findById(acceptance.id))?.projectId).toBeNull();
+  });
+
   it('keeps the first standalone display title and backfills one when initially absent', async () => {
     const model = new AcceptanceModel(serverDB, userId);
     const subjectId = 'standalone-external-delivery';
@@ -109,6 +146,40 @@ describe('AcceptanceModel', () => {
 
     const otherModel = new AcceptanceModel(serverDB, otherUserId);
     expect(await otherModel.findBySubject('topic', topicId)).toBeUndefined();
+  });
+
+  it('reads many subjects statuses in one call, however old they are', async () => {
+    const model = new AcceptanceModel(serverDB, userId);
+    const olderTopicId = 'acceptance-test-topic-older';
+    await serverDB.insert(topics).values([{ id: olderTopicId, userId }]);
+
+    const older = await model.ensureForSubject('topic', olderTopicId);
+    await model.updateStatus(older.id, 'accepted');
+    const newer = await model.ensureForSubject('topic', topicId);
+    await model.updateStatus(newer.id, 'delivered');
+
+    // The recency-capped feed is what this exists to replace: asked about a
+    // subject, it answers about that subject, not about the newest N rows.
+    const statuses = await model.listStatusesBySubjects('topic', [olderTopicId, topicId]);
+
+    expect(Object.fromEntries(statuses.map((row) => [row.subjectId, row.status]))).toEqual({
+      [olderTopicId]: 'accepted',
+      [topicId]: 'delivered',
+    });
+  });
+
+  it('omits subjects with no acceptance, and never crosses owners', async () => {
+    const model = new AcceptanceModel(serverDB, userId);
+    await model.ensureForSubject('topic', topicId);
+
+    await expect(model.listStatusesBySubjects('topic', ['no-such-subject'])).resolves.toEqual([]);
+    await expect(model.listStatusesBySubjects('topic', [])).resolves.toEqual([]);
+    // Same subject id, different owner — must not leak.
+    await expect(
+      new AcceptanceModel(serverDB, otherUserId).listStatusesBySubjects('topic', [topicId]),
+    ).resolves.toEqual([]);
+    // Right id, wrong subject type.
+    await expect(model.listStatusesBySubjects('task', [topicId])).resolves.toEqual([]);
   });
 
   it('updateStatus stamps completedAt only on user-terminal statuses', async () => {

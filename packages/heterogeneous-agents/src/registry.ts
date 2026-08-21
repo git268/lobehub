@@ -9,10 +9,16 @@ import {
   AmpAdapter,
   ClaudeCodeAdapter,
   ClaudeCodeSdkAdapter,
+  CodeBuddyAdapter,
   CodexAdapter,
+  CursorAcpAdapter,
+  CursorAdapter,
+  GrokBuildAdapter,
+  KimiCodeAdapter,
   OpenCodeAdapter,
   PiAdapter,
   QoderAdapter,
+  TraeAcpAdapter,
 } from './adapters';
 import type { LocalHeterogeneousAgentType } from './config';
 import type { AgentEventAdapter } from './types';
@@ -28,8 +34,20 @@ const localAgentRegistry = {
   'claude-code': {
     createAdapter: () => new ClaudeCodeAdapter(),
   },
+  'codebuddy': {
+    createAdapter: () => new CodeBuddyAdapter(),
+  },
   'codex': {
     createAdapter: () => new CodexAdapter(),
+  },
+  'cursor': {
+    createAdapter: () => new CursorAdapter(),
+  },
+  'grok-build': {
+    createAdapter: () => new GrokBuildAdapter(),
+  },
+  'kimi-code': {
+    createAdapter: () => new KimiCodeAdapter(),
   },
   'opencode': {
     createAdapter: () => new OpenCodeAdapter(),
@@ -40,12 +58,18 @@ const localAgentRegistry = {
   'qoder': {
     createAdapter: () => new QoderAdapter(),
   },
+  'trae': {
+    createAdapter: () => new TraeAcpAdapter(),
+  },
   // 'kimi-cli': { createAdapter: () => new KimiCLIAdapter() },
 } satisfies Record<LocalHeterogeneousAgentType, AgentRegistryEntry>;
 
 const runtimeAdapterRegistry = {
   'claude-code-sdk': {
     createAdapter: () => new ClaudeCodeSdkAdapter(),
+  },
+  'cursor-acp': {
+    createAdapter: () => new CursorAcpAdapter(),
   },
 } satisfies Record<string, AgentRegistryEntry>;
 

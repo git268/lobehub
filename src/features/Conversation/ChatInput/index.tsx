@@ -3,7 +3,8 @@
 import { type VoiceMessageRecording } from '@lobechat/types';
 import { type SlashOptions } from '@lobehub/editor';
 import { type ChatInputActionsProps } from '@lobehub/editor/react';
-import { Alert, Flexbox, type MenuProps } from '@lobehub/ui';
+import { Flexbox, type MenuProps } from '@lobehub/ui';
+import { Alert } from '@lobehub/ui/base-ui';
 import { type ReactNode } from 'react';
 import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -279,7 +280,7 @@ const ChatInput = memo<ChatInputProps>(
     );
 
     // Pre-topic "armed goal" state (topic Goal lab). `armedAt` is only ever set
-    // by the lab-gated "+" → Set goal entry, so its presence already implies the
+    // by the lab-gated "+" → Goal entry, so its presence already implies the
     // lab is on. While armed the goal chip rides the action bar and the composer
     // placeholder prompts for the goal (the next message becomes it).
     const goalArmedAt = useGoalArmStore((s) => (agentId ? s.armedAt[agentId] : undefined));

@@ -1,5 +1,5 @@
 import type { AcceptanceStatus, AcceptanceSubjectType } from '@lobechat/types';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 
 import type { AcceptanceItem, NewAcceptance } from '../schemas/verify';
 import { acceptances } from '../schemas/verify';
@@ -75,6 +75,30 @@ export class AcceptanceModel {
   };
 
   /**
+   * The status of many subjects' acceptances in one read — for list surfaces
+   * that must know each row's state without a request per row. Exact where the
+   * recency-capped `query()` is not: it answers about the subjects asked for,
+   * however old they are, and one acceptance per subject is a scope invariant.
+   */
+  listStatusesBySubjects = async (
+    subjectType: AcceptanceSubjectType,
+    subjectIds: string[],
+  ): Promise<Array<{ status: string; subjectId: string }>> => {
+    if (subjectIds.length === 0) return [];
+
+    return this.db
+      .select({ status: acceptances.status, subjectId: acceptances.subjectId })
+      .from(acceptances)
+      .where(
+        and(
+          eq(acceptances.subjectType, subjectType),
+          inArray(acceptances.subjectId, subjectIds),
+          this.ownership(),
+        ),
+      );
+  };
+
+  /**
    * Get (or lazily create) the acceptance aggregate for a subject. Upserts on
    * the per-scope subject unique index so concurrent callers converge on one
    * row; `defaults` only apply on first creation and never overwrite an
@@ -83,7 +107,7 @@ export class AcceptanceModel {
   ensureForSubject = async (
     subjectType: AcceptanceSubjectType,
     subjectId: string,
-    defaults?: Partial<Pick<NewAcceptance, 'config' | 'metadata' | 'requirement'>>,
+    defaults?: Partial<Pick<NewAcceptance, 'config' | 'metadata' | 'projectId' | 'requirement'>>,
   ): Promise<AcceptanceItem> => {
     const existing = await this.findBySubject(subjectType, subjectId);
     if (existing) {
@@ -92,22 +116,25 @@ export class AcceptanceModel {
       // non-empty statement a later round supplies, instead of staying blank
       // forever ("尚未记录该对象的验收目标").
       const nextRequirement = !existing.requirement ? defaults?.requirement : undefined;
+      const nextProjectId = !existing.projectId ? defaults?.projectId : undefined;
       const nextTitle =
         !existing.metadata?.title && typeof defaults?.metadata?.title === 'string'
           ? defaults.metadata.title
           : undefined;
-      if (nextRequirement || nextTitle) {
+      if (nextProjectId || nextRequirement || nextTitle) {
         const metadata = nextTitle ? { ...existing.metadata, title: nextTitle } : existing.metadata;
         await this.db
           .update(acceptances)
           .set({
             metadata,
+            projectId: nextProjectId ?? existing.projectId,
             requirement: nextRequirement ?? existing.requirement,
           })
           .where(eq(acceptances.id, existing.id));
         return {
           ...existing,
           metadata,
+          projectId: nextProjectId ?? existing.projectId,
           requirement: nextRequirement ?? existing.requirement,
         };
       }
@@ -141,7 +168,10 @@ export class AcceptanceModel {
   update = async (
     id: string,
     value: Partial<
-      Pick<NewAcceptance, 'config' | 'metadata' | 'requirement' | 'visibility' | 'visualRender'>
+      Pick<
+        NewAcceptance,
+        'config' | 'metadata' | 'projectId' | 'requirement' | 'visibility' | 'visualRender'
+      >
     >,
   ): Promise<AcceptanceItem | undefined> => {
     const [row] = await this.db
