@@ -68,6 +68,7 @@ import type {
   ExecSubAgentParams,
   ExecSubAgentResult,
   ExecVirtualSubAgentParams,
+  HeterogeneousTopicModel,
   LobeAgentAgencyConfig,
   LobeAgentChatConfig,
   LobeAgentConfig,
@@ -81,6 +82,7 @@ import type {
 } from '@lobechat/types';
 import {
   AgentGraphSchema,
+  applyTopicModelToHeterogeneousProvider,
   buildHeteroExecArgs,
   ChatErrorType,
   getActivePluginIds,
@@ -89,6 +91,7 @@ import {
   RequestTrigger,
   resolveAgentAgencyConfig,
   resolveAgentModelConfig,
+  resolveHeterogeneousProviderTopicModel,
   ThreadStatus,
   ThreadType,
 } from '@lobechat/types';
@@ -129,7 +132,7 @@ import {
 import { shouldEnableBuiltinSkill } from '@/helpers/skillFilters';
 import { buildConnectorManifests } from '@/libs/mcp/buildConnectorManifests';
 import { patchManifestWithPermissions } from '@/libs/mcp/connectorPermissionCheck';
-import { signOperationJwt, signUserJWT } from '@/libs/trpc/utils/internalJwt';
+import { signHeteroOperationJWT, signUserJWT } from '@/libs/trpc/utils/internalJwt';
 import {
   createAgentStateManager,
   createStreamEventManager,
@@ -144,6 +147,7 @@ import type {
   AgentExecutionParams,
   AgentExecutionResult,
   AgentRuntimeServiceOptions,
+  EvalRuntimeContext,
   SubAgentBridgeParams,
 } from '@/server/services/agentRuntime';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
@@ -413,6 +417,14 @@ interface InternalExecAgentParams extends ExecAgentParams {
   ephemeralUserMessage?: string;
   /** Eval context for injecting environment prompts into system message */
   evalContext?: EvalContext;
+  /** Eval execution controls, such as fixture tool forwarding. */
+  evalRuntime?: EvalRuntimeContext;
+  /**
+   * Restrict this orchestration turn to exactly these plugins. Unlike
+   * `additionalPluginIds`, this excludes the agent's pinned and default tools
+   * as well as activator-discoverable manifests.
+   */
+  exclusivePluginIds?: string[];
   /** External files to upload to S3 and attach to the user message */
   files?: Array<{
     /** Pre-downloaded buffer (from adapter/platform layer) */
@@ -429,6 +441,14 @@ interface InternalExecAgentParams extends ExecAgentParams {
   hooks?: AgentHook[];
   /** Initial step count offset for resumed operations (accumulated from previous runs) */
   initialStepCount?: number;
+  /**
+   * This start came from a person waiting at a composer, not from a background
+   * producer (task callback, cron, bot, API). Interactive starts serialize only
+   * on the short topic-start reservation and never on `runningOperation` — the
+   * client already owns "one foreground turn at a time" with a queue and a UI,
+   * and a refusal here destroys the message before it is ever persisted.
+   */
+  interactiveStart?: boolean;
   /** Maximum steps for the agent operation */
   maxSteps?: number;
   /**
@@ -1336,6 +1356,7 @@ export class AiAgentService {
     const reserved = await acquireTopicStartReservation({
       replacesOperationId: params.replacesOperationId,
       allowRunningOperationId: params.topicStartOwnerOperationId,
+      ignoreRunningOperation: params.interactiveStart,
       reservationId,
       topicId,
       topicModel: this.topicModel,
@@ -1357,6 +1378,7 @@ export class AiAgentService {
   ): Promise<ExecAgentResult> {
     const {
       additionalPluginIds,
+      exclusivePluginIds,
       agentId,
       slug,
       prompt,
@@ -1385,6 +1407,7 @@ export class AiAgentService {
       cronJobId,
       taskId,
       evalContext,
+      evalRuntime,
       maxSteps,
       disableLocalSystem,
       initialStepCount,
@@ -2015,6 +2038,11 @@ export class AiAgentService {
     // getTopicModelById).
     let model = agentConfig.model!;
     let provider = agentConfig.provider!;
+    const heterogeneousProvider = agentConfig.agencyConfig?.heterogeneousProvider;
+    const heterogeneousTopicModelSnapshot = heterogeneousProvider
+      ? resolveHeterogeneousProviderTopicModel(heterogeneousProvider)
+      : undefined;
+    let pinnedHeterogeneousTopicModel: HeterogeneousTopicModel | undefined;
 
     if (!topicId) {
       if (resume) {
@@ -2057,16 +2085,12 @@ export class AiAgentService {
           : undefined;
 
       const fallbackTitleSource = markdownToTxt(prompt);
-      // A heterogeneous agent has no chat model to snapshot: the external CLI
-      // owns model selection, so `model` here is a stale agent default and
-      // `provider` is NULL (defaulted to the platform chat provider) on every
-      // agent created before the runtime type was stamped on the agent row.
-      // Pin the runtime type and leave the model to the per-run backfill — the
-      // same rule the assistant placeholder below and the client's
-      // `snapshotAgentModel` follow. Detection mirrors the hetero early exit.
+      // Heterogeneous topics use the same snapshot rule as the client: persist
+      // the selected CLI model (including `default`) or user-provider API binding.
+      // Runtimes without a model selector, legacy rows, and Agent-scoped
+      // server-default API configs still pin only the runtime type.
       const heteroSnapshotType =
-        agentConfig.agencyConfig?.heterogeneousProvider?.type ??
-        (isHeterogeneousAgentModelId(model) ? model : undefined);
+        heterogeneousProvider?.type ?? (isHeterogeneousAgentModelId(model) ? model : undefined);
       // Second argument: the id the client already rendered this topic under
       // (sidebar row, message bucket). Absent → the model mints one as before.
       const newTopic = await this.topicModel.create(
@@ -2082,8 +2106,8 @@ export class AiAgentService {
           groupId: appContext?.groupId,
           metadata,
           // Snapshot the effective model as the topic's pinned model (config).
-          model: heteroSnapshotType ? undefined : model,
-          provider: heteroSnapshotType ?? provider,
+          model: heterogeneousTopicModelSnapshot?.model ?? (heteroSnapshotType ? undefined : model),
+          provider: heterogeneousTopicModelSnapshot?.provider ?? heteroSnapshotType ?? provider,
           title:
             title !== undefined
               ? title
@@ -2113,6 +2137,7 @@ export class AiAgentService {
       if (pinnedModel) {
         model = modelOverride || pinnedModel;
         provider = providerOverride || existingTopic?.provider || provider;
+        pinnedHeterogeneousTopicModel = { model, provider };
         log(
           'execAgent: using topic-pinned model=%s provider=%s for topic %s',
           model,
@@ -2323,41 +2348,28 @@ export class AiAgentService {
       // generated here (authoritative) and flows through to heteroIngest /
       // heteroFinish unchanged. Without this row the run is invisible to the
       // operation lifecycle: verify (ensureForOperation), repair (parent chain),
-      // judge (op.model/provider) and tracing all key off it. Terminal state +
-      // the trace snapshot are written back in heteroFinish. Non-fatal: a
-      // tracing/op-row insert hiccup must never fail the user's run.
-      try {
-        // Route through CompletionLifecycle — NOT the raw operation model — so the
-        // hetero run is a first-class lifecycle peer of the in-process runtime.
-        // recordStart additionally instantiates the task's verify plan when this
-        // is a top-level task op (taskId && !parentOperationId); the hetero finish
-        // side (heteroFinish → CompletionLifecycle.dispatchHooks) then runs the
-        // delivery-checker gate against that plan. Calling the bare operation model
-        // here is exactly what silently degraded verify to off for every hetero
-        // task run (the plan was never created at start).
-        await new CompletionLifecycle(this.db, this.userId, this.workspaceId).recordStart({
-          agentId: persistAgentId,
-          chatGroupId: appContext?.groupId ?? null,
-          maxSteps,
-          // Seed the heterogeneous provider (claude-code / codex / …), NOT the
-          // agent's configured chat provider — the run executes on the CLI, so
-          // `provider` (e.g. `lobehub`) and `model` (e.g. `deepseek-v4-pro`) are
-          // irrelevant. `model` is intentionally left unset: the real executed
-          // model arrives mid-stream and is backfilled by heteroFinish. Mirrors the
-          // assistant-message seeding above (provider: heteroType, model: undefined).
-          operationId,
-          // Top-level dispatch carries no parent; pass it through so the verify
-          // plan gate (taskId && !parentOperationId) reads the real lineage and a
-          // repair/verifier sub-run never re-instantiates its own plan here.
-          parentOperationId,
-          provider: heteroType,
-          taskId: operationTaskId ?? null,
-          threadId: appContext?.threadId ?? null,
-          topicId,
-          trigger,
-        });
-      } catch (err) {
-        log('execAgent: hetero recordStart failed (non-fatal): %O', err);
+      // judge (op.model/provider) and tracing all key off it. The durable row is
+      // also an authentication prerequisite: every callback
+      // re-authorizes its operation token against this exact principal. Do not
+      // mint a token or dispatch/spawn when persistence fails.
+      const operationPersisted = await new CompletionLifecycle(
+        this.db,
+        this.userId,
+        this.workspaceId,
+      ).recordStart({
+        agentId: persistAgentId,
+        chatGroupId: appContext?.groupId ?? null,
+        maxSteps,
+        operationId,
+        parentOperationId,
+        provider: heteroType,
+        taskId: operationTaskId ?? null,
+        threadId: appContext?.threadId ?? null,
+        topicId,
+        trigger,
+      });
+      if (!operationPersisted) {
+        throw new Error('Failed to persist heterogeneous agent operation');
       }
 
       // Read resume session id for next-turn continuity.
@@ -2369,7 +2381,12 @@ export class AiAgentService {
       // heteroIngest / heteroFinish without full user credentials.
       let operationJwt: string;
       try {
-        operationJwt = await signOperationJwt(this.userId);
+        operationJwt = await signHeteroOperationJWT({
+          capabilities: ['hetero:ingest', 'hetero:finish', 'hetero:intervention:read'],
+          operationId,
+          userId: this.userId,
+          workspaceId: this.workspaceId,
+        });
       } catch (err) {
         log('execAgent: failed to sign operation JWT for hetero run: %O', err);
         throw new Error('Failed to sign operation JWT for hetero agent', { cause: err });
@@ -2459,8 +2476,11 @@ export class AiAgentService {
           : undefined;
       const heteroExecArgs = isLocalHeterogeneousType(heteroType)
         ? buildHeteroExecArgs(
-            agentConfig.agencyConfig?.heterogeneousProvider?.type === heteroType
-              ? agentConfig.agencyConfig.heterogeneousProvider
+            heterogeneousProvider?.type === heteroType
+              ? applyTopicModelToHeterogeneousProvider(
+                  heterogeneousProvider,
+                  pinnedHeterogeneousTopicModel,
+                )
               : { type: heteroType },
           )
         : undefined;
@@ -2529,6 +2549,7 @@ export class AiAgentService {
       const childOperation = {
         assistantMessageId: assistantMessageRecord.id,
         hooks: serializedHooks,
+        startedAt: new Date().toISOString(),
         ...(isRemoteHetero && remoteDeviceId
           ? {
               deviceId: remoteDeviceId,
@@ -2578,20 +2599,52 @@ export class AiAgentService {
             userMessageId: userMessageRecord?.id ?? parentMessageId ?? '',
           };
         }
-      } else {
+      } else if (appContext?.isolationThread && parentOperationId) {
+        // Isolation-thread children (callAgent / callSubAgent) run on the
+        // SPAWNER's topic and finish long before it does. heteroIngest and
+        // heteroFinish both require this child's operationId to resolve via
+        // topic.metadata.runningOperation (root or childOperations) — see
+        // the comment above childOperation — or every streamed batch is
+        // dropped as stale and the terminal onComplete hooks (including the
+        // callAgent resume bridge) never fire. Nest under the parent's own
+        // marker instead of claiming the topic-level root outright, so the
+        // parent's marker survives for the rest of its still-running turn.
+        const attachedToParent = await this.topicModel.appendRunningOperationChild(
+          topicId,
+          parentOperationId,
+          childOperation,
+        );
+        if (!attachedToParent) {
+          // Parent isn't (or is no longer) the topic's current root marker —
+          // e.g. a nested isolation chain, or the parent already settled.
+          // Fall back to claiming the marker directly so this child is still
+          // discoverable by its own operationId, rather than permanently
+          // unrecognized by heteroIngest/heteroFinish.
+          await this.topicModel.updateMetadata(topicId, { runningOperation: childOperation });
+        }
+      } else if (!appContext?.isolationThread) {
         await this.topicModel.updateMetadata(topicId, { runningOperation: childOperation });
       }
 
-      const persistMirrorTarget = async () => {
-        if (!params.topicStartOwnerOperationId) return;
+      // Always persist operation metadata (userId/workspaceId) to the state
+      // manager, not just for topic-owner-mirrored runs. `subAgentCallback`
+      // (the QStash-delivered completion bridge for callAgent/callSubAgent
+      // children) resolves `userId` from this same store to authorize
+      // resuming the parent — without it, a hetero child spawned via
+      // callAgent has no metadata row, the callback 401s, and the parent
+      // operation is never resumed (stays parked until the inactivity
+      // watchdog abandons it).
+      const persistOperationMetadata = async () => {
         try {
           await createAgentStateManager().createOperationMetadata(operationId, {
-            mirrorToOperationId: params.topicStartOwnerOperationId,
+            ...(params.topicStartOwnerOperationId && {
+              mirrorToOperationId: params.topicStartOwnerOperationId,
+            }),
             userId: this.userId,
             workspaceId: this.workspaceId,
           });
         } catch (err) {
-          log('execAgent: failed to persist hetero mirror target: %O', err);
+          log('execAgent: failed to persist hetero operation metadata: %O', err);
         }
       };
 
@@ -2685,7 +2738,7 @@ export class AiAgentService {
 
         // Open the stream channel so the gateway WS subscription can receive
         // notify_update events published by agentNotify.notify.
-        await persistMirrorTarget();
+        await persistOperationMetadata();
         const streamManager = createStreamEventManager();
         await streamManager
           .publishAgentRuntimeInit(operationId, {
@@ -2788,7 +2841,7 @@ export class AiAgentService {
         // the init only powers reconnect, not the run. `createStreamEventManager`
         // probes Redis synchronously, so guard construction too, not just publish.
         try {
-          await persistMirrorTarget();
+          await persistOperationMetadata();
           await createStreamEventManager().publishAgentRuntimeInit(operationId, {
             agentId: resolvedAgentId,
             assistantMessageId: assistantMessageRecord.id,
@@ -3098,16 +3151,18 @@ export class AiAgentService {
     // `additionalPluginIds` so a mentioned-but-not-pinned tool (e.g. a custom MCP
     // connector) is both queried for manifests and enabled by the tools engine.
     const isGoalTurn = isGoalPrompt(prompt);
-    let agentPlugins: string[] = isGoalTurn
-      ? [GoalIdentifier]
-      : [
-          ...new Set([
-            ...getActivePluginIds(agentConfig?.plugins),
-            ...(additionalPluginIds || []),
-            ...(selectedToolIds || []),
-            ...(hasMentionedAgents ? ['lobe-agent-management'] : []),
-          ]),
-        ];
+    let agentPlugins: string[] = exclusivePluginIds
+      ? [...new Set(exclusivePluginIds)]
+      : isGoalTurn
+        ? [GoalIdentifier]
+        : [
+            ...new Set([
+              ...getActivePluginIds(agentConfig?.plugins),
+              ...(additionalPluginIds || []),
+              ...(selectedToolIds || []),
+              ...(hasMentionedAgents ? ['lobe-agent-management'] : []),
+            ]),
+          ];
 
     // Model metadata is needed both for tool support checks and agent-management context.
     const { loadModels } = await import('@/business/client/model-bank/loadModels');
@@ -3744,18 +3799,20 @@ export class AiAgentService {
       });
 
       // 5f. Generate tools and manifest map
-      const pluginIds = [
-        ...new Set([
-          ...agentPlugins,
-          ...(disableLocalSystem ? [] : [LocalSystemManifest.identifier]),
-          RemoteDeviceManifest.identifier,
-          // Include LobeHub Skills and Composio tools so they are passed to generateToolsDetailed
-          ...activeLobehubSkillManifests.map((m) => m.identifier),
-          ...activeComposioManifests.map((m) => m.identifier),
-          // Connector manifests are also injected as additionalManifests
-          ...activeConnectorManifests.map((m) => m.identifier),
-        ]),
-      ];
+      const pluginIds = exclusivePluginIds
+        ? agentPlugins
+        : [
+            ...new Set([
+              ...agentPlugins,
+              ...(disableLocalSystem ? [] : [LocalSystemManifest.identifier]),
+              RemoteDeviceManifest.identifier,
+              // Include LobeHub Skills and Composio tools so they are passed to generateToolsDetailed
+              ...activeLobehubSkillManifests.map((m) => m.identifier),
+              ...activeComposioManifests.map((m) => m.identifier),
+              // Connector manifests are also injected as additionalManifests
+              ...activeConnectorManifests.map((m) => m.identifier),
+            ]),
+          ];
       log('execAgent: agent configured plugins: %O', pluginIds);
 
       const isManualMode = agentConfig.chatConfig?.skillActivateMode === 'manual';
@@ -3764,6 +3821,7 @@ export class AiAgentService {
         excludeDefaultToolIds: isManualMode ? manualModeExcludeToolIds : undefined,
         model,
         provider,
+        skipDefaultTools: !!exclusivePluginIds,
         toolIds: pluginIds,
       });
 
@@ -3786,6 +3844,7 @@ export class AiAgentService {
       // Enforced here (not as a point deletion after the seed) so the later
       // Skill/Composio ingest loops cannot re-add the identifier.
       const isManifestIngestAllowed = (identifier: string): boolean => {
+        if (exclusivePluginIds && !exclusivePluginIds.includes(identifier)) return false;
         if (disabledPluginIdSet.has(identifier)) return false;
         if (!canUseDevice && isDeviceToolIdentifier(identifier)) return false;
         if (deviceLocked && REMOTE_DEVICE_TOOL_IDENTIFIERS.has(identifier)) return false;
@@ -4809,6 +4868,7 @@ export class AiAgentService {
         deviceAccessPolicy: { canUseDevice, reason: deviceAccessReason },
         discordContext,
         evalContext,
+        evalRuntime,
         enableExpertise,
         expertise,
         initialContext,
@@ -4858,6 +4918,9 @@ export class AiAgentService {
             assistantMessageId: assistantMessageRecord.id,
             operationId,
             scope: appContext?.scope ?? undefined,
+            // Liveness stamp — without it this marker can never be proven dead
+            // and would hold the topic against background starts forever.
+            startedAt: new Date().toISOString(),
             threadId: appContext?.threadId ?? undefined,
           },
         });

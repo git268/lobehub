@@ -403,8 +403,9 @@ export default {
   'heterogeneousStatus.apiMode.configureProvider': 'Go to provider settings',
   'heterogeneousStatus.apiMode.enableInLabs': 'Enable in Labs',
   'heterogeneousStatus.apiMode.labDisabled':
-    'Provider binding is a Labs experiment. Enable it to use a configured API provider instead of the agent subscription.',
+    'API mode is a Labs experiment. Enable it to use the LobeHub default provider or a configured API provider instead of the agent subscription.',
   'heterogeneousStatus.apiMode.localOnly': 'Available only for Desktop local execution',
+  'heterogeneousStatus.apiMode.defaultProvider': 'LobeHub',
   'heterogeneousStatus.apiMode.model': 'Model',
   'heterogeneousStatus.apiMode.modelPlaceholder': 'Select a model',
   'heterogeneousStatus.apiMode.noProviders':
@@ -415,6 +416,21 @@ export default {
   'heterogeneousStatus.apiMode.smallFastModelDesc':
     'Used for session titles, summaries, and other background work. Does not change the main conversation.',
   'heterogeneousStatus.apiMode.smallFastModelPlaceholder': 'Same as primary model',
+  'heterogeneousStatus.apiMode.provider': 'Provider',
+  'heterogeneousStatus.apiMode.providerPlaceholder': 'Select a provider',
+  'heterogeneousStatus.apiMode.workspaceUnsupported': 'Not available for workspace agents',
+  'heterogeneousStatus.apiMode.serverDefault.checking': 'Checking deployment provider...',
+  'heterogeneousStatus.apiMode.serverDefault.disabled':
+    'The deployment administrator has disabled the default API provider for heterogeneous agents.',
+  'heterogeneousStatus.apiMode.serverDefault.invalidConfiguration':
+    'The deployment provider or its compatible models are not configured.',
+  'heterogeneousStatus.apiMode.serverDefault.loadFailed':
+    'Could not check the deployment provider.',
+  'heterogeneousStatus.apiMode.serverDefault.noModels':
+    'No compatible models are available from the deployment provider.',
+  'heterogeneousStatus.apiMode.serverDefault.retry': 'Retry',
+  'heterogeneousStatus.apiMode.serverDefault.unsupported':
+    'The deployment provider does not expose a compatible model for this CLI.',
   'heterogeneousStatus.auth.api': 'API',
   'heterogeneousStatus.auth.label': 'Auth Method',
   'heterogeneousStatus.auth.subscription': 'Subscription',
@@ -650,22 +666,28 @@ export default {
   'devices.visibilityTabs.workspace': 'Workspace',
   'devices.workingDirectory': 'Working dir: {{path}}',
   'apps.cli.copied': 'Copied',
-  'apps.cli.copy': 'Copy install command',
-  'apps.cli.desc': 'Scripts, devices, and headless work from the command line.',
+  'apps.cli.copy': 'Copy',
+  'apps.cli.desc': 'Scripts, cron jobs, and headless agents — the same LobeHub, from any terminal.',
   'apps.cli.title': 'CLI',
   'apps.desktop.cta': 'Get desktop app',
-  'apps.desktop.desc': 'Local files, system tools, and focused work on this machine.',
+  'apps.desktop.desc': 'Chat, build, and automate in one app, with full access to this machine:',
+  'apps.desktop.features.files.desc': 'read, write, and organize your folders',
+  'apps.desktop.features.files.label': 'Local files',
+  'apps.desktop.features.focus.desc': 'a dedicated window, away from browser tabs',
+  'apps.desktop.features.focus.label': 'Focused work',
+  'apps.desktop.features.tools.desc': 'screenshots, notifications, shell',
+  'apps.desktop.features.tools.label': 'System tools',
   'apps.desktop.inUse': 'In use',
   'apps.desktop.inUseDesc': "You're already in the desktop app.",
   'apps.desktop.title': 'Desktop',
-  'apps.kicker': 'Ways',
-  'apps.messenger.cta': 'Set up Messenger',
-  'apps.messenger.desc': 'Talk to LobeHub in Discord, Feishu, Slack, and the rest.',
+  'apps.messenger.desc':
+    'Talk to your agents where your team already is — replies land back in LobeHub.',
+  'apps.messenger.setup': 'Set up',
   'apps.messenger.title': 'Messenger',
   'apps.mobile.cta': 'Get mobile app',
-  'apps.mobile.desc': 'Start conversations from your phone when you leave the computer.',
+  'apps.mobile.desc': 'Pick up where you left off — your chats, agents, and files travel with you.',
   'apps.mobile.title': 'Mobile',
-  'apps.title': 'Discover more ways to use LobeHub',
+  'apps.title': 'Do more with LobeHub, everywhere you work',
   'checkingPermissions': 'Checking permissions...',
   'danger.reset.action': 'Reset Now',
   'danger.reset.confirm': 'Reset all settings?',
@@ -1528,6 +1550,9 @@ When I am ___, I need ___
   'systemAgent.expertise.modelDesc':
     'Model used to draft expertise domains and extract reusable experience from conversations.',
   'systemAgent.expertise.title': 'Agent Self-Evolution',
+  'systemAgent.goal.modelDesc':
+    'Model used to turn a persistent goal into its standing acceptance criteria.',
+  'systemAgent.goal.title': 'Goal Creation',
   'systemAgent.customPrompt.addPrompt': 'Add Custom Prompt',
   'systemAgent.customPrompt.desc':
     'Once filled out, the system agent will use the custom prompt when generating content',

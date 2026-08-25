@@ -425,6 +425,26 @@ content styles to change that.
 the modal `footer` slot. Assert `footer.top === scroller.bottom` at both ends of the
 list, not just that the dialog opened.
 
+### L-D11 — Trusting a popover to flip itself away from the viewport edge
+
+**Wrong approach:** anchor a hover card to a full-width list row, screenshot it once from a
+row near the top of the list, and assume the popover library will flip or shift the card
+when a lower row leaves no room below.
+
+**Why it fails:** popovers here render into the app's portal container, and side flipping
+does not kick in from it — the popup keeps `data-side="bottom"` and simply extends past the
+viewport, even when the space above the trigger would have fitted it. Adding
+`collisionPadding` does not change that. The screenshot still looks like a working card,
+because the part that fell off the bottom is the part you cannot see; only the tail of the
+content (the last evidence row, a footer hint, an action) becomes unreachable.
+
+**Correct approach:** for any hover/click popup whose content height is data-dependent,
+assert its rect against the viewport (`getBoundingClientRect().bottom` vs
+`window.innerHeight`) with the trigger at the **bottom** of its list, not the top — a
+non-negative overflow is a defect regardless of how the screenshot reads. Bound the content
+by the space the positioner publishes (`--available-height`, less the popup's own chrome)
+rather than relying on collision flipping.
+
 ## Environment safety
 
 ### L-S0 — Concluding a dependency moved from the root manifest alone
@@ -737,3 +757,19 @@ numerically (alpha at the corners vs the subject, encoded format signature, dime
 and where the property is compositional, show the artifact over a contrasting surface.
 When the model cannot deliver the property, produce it in code after generation rather
 than re-wording the prompt.
+
+### L-S15 — Trusting a lockfile-false workspace's node\_modules to track current specs
+
+**Wrong approach:** debug a "missing export" build failure in a workspace with
+`lockfile: false` by bumping package.json specs or running `pnpm up`, assuming the
+next install re-resolves.
+
+**Why it fails:** pnpm keeps a hidden `node_modules/.pnpm/lock.yaml` that freezes
+prior resolutions even with `lockfile: false`; `pnpm install` and `pnpm up` can
+report success while every symlink stays on the stale version. CI never hits this
+because it installs from scratch.
+
+**Correct approach:** when installed versions contradict fresh-resolution
+expectations, delete the hidden `node_modules/.pnpm/lock.yaml` (or the whole
+node\_modules) in the affected workspace root and reinstall, then re-verify the
+actual resolved version via the importing package's symlink.
