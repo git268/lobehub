@@ -1,6 +1,6 @@
 import type { LobeAgentChatConfig } from '@lobechat/types';
-import type { AiModelReasoningConfig, ExtendParamsType } from 'model-bank';
-import { MODEL_REASONING_EXTEND_PARAMS } from 'model-bank';
+import type { AiModelReasoningConfig, ExtendParamsType } from 'model-bank/aiModel';
+import { MODEL_REASONING_EXTEND_PARAMS } from 'model-bank/aiModel';
 
 import { isAdaptiveThinkingDefaultOnModel } from '../providers/anthropic/modelId';
 
@@ -382,6 +382,27 @@ export const applyModelExtendParams = (ctx: ApplyModelExtendParamsContext): Mode
         ...extendParams.thinking,
         type: 'enabled',
       };
+    }
+  }
+
+  // Qwen3.8 Max: none disables thinking; otherwise enable thinking + set effort.
+  if (modelExtendParams.includes('qwen38ReasoningEffort')) {
+    const qwen38ReasoningEffort = chatConfig.qwen38ReasoningEffort;
+
+    if (typeof qwen38ReasoningEffort === 'string') {
+      if (qwen38ReasoningEffort === 'none') {
+        delete extendParams.reasoning_effort;
+        extendParams.thinking = {
+          ...extendParams.thinking,
+          type: 'disabled',
+        };
+      } else {
+        extendParams.reasoning_effort = qwen38ReasoningEffort;
+        extendParams.thinking = {
+          ...extendParams.thinking,
+          type: 'enabled',
+        };
+      }
     }
   }
 

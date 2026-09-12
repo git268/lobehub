@@ -15,7 +15,7 @@ import type {
   AgentShareItem,
   NormalizedAgentShareConfig,
 } from '../schemas';
-import { agents, agentShares } from '../schemas';
+import { agents, agentShares, users } from '../schemas';
 import type { LobeChatDatabase } from '../type';
 import { normalizeInboxAgentAvatar, normalizeInboxAgentTitle } from '../utils/inboxAgent';
 import { isUuid } from '../utils/uuid';
@@ -60,7 +60,23 @@ export type AgentShareData = NonNullable<
 /** Minimal locked-row snapshot returned by {@link AgentShareModel.lockOwnedAgentRow}. */
 interface LockedAgentSnapshot {
   id: string;
+  /** The agent's own profile slug (`agents.slug`), unique per owner only. */
+  slug: string | null;
 }
+
+/**
+ * Static share-slug rules shared by the owner-facing `updateSlug` and the
+ * best-effort seed in `create`. A UUID-shaped slug would be unreachable:
+ * `findBySlugOrId` resolves UUID-shaped input as a share id before ever trying
+ * the slug lookup. Returns `null` when the slug passes.
+ */
+const getShareSlugRejection = (
+  slug: string,
+): 'INVALID_SHARE_SLUG' | 'RESERVED_SHARE_SLUG' | null => {
+  if (!AGENT_SHARE_SLUG_PATTERN.test(slug) || isUuid(slug)) return 'INVALID_SHARE_SLUG';
+  if (RESERVED_AGENT_SHARE_SLUGS.includes(slug)) return 'RESERVED_SHARE_SLUG';
+  return null;
+};
 
 export class AgentShareModel {
   private db: LobeChatDatabase;
@@ -103,12 +119,68 @@ export class AgentShareModel {
     ownerId: string,
   ): Promise<LockedAgentSnapshot | null> => {
     const [agent] = await tx
-      .select({ id: agents.id })
+      .select({ id: agents.id, slug: agents.slug })
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.userId, ownerId), isNull(agents.workspaceId)))
       .for('update');
 
     return agent ?? null;
+  };
+
+  /**
+   * Cross-agent slug uniqueness barrier, to be called from an already-open
+   * transaction. `shareConfig.slug` has no unique index (see the schema
+   * JSDoc), and the `agents.id FOR UPDATE` lock only serializes writes on the
+   * SAME agent: two agents racing for one slug hold different row locks and
+   * would both pass a plain conflict SELECT (neither sees the other's
+   * uncommitted write). The check is therefore additionally serialized on a
+   * transaction-scoped advisory lock keyed by the slug itself, released
+   * automatically at commit/rollback.
+   */
+  private static isShareSlugTaken = async (
+    tx: LobeChatDatabase,
+    slug: string,
+    agentId: string,
+  ): Promise<boolean> => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`agent_share_slug:${slug}`}))`);
+
+    const [conflict] = await tx
+      .select({ id: agentShares.id })
+      .from(agentShares)
+      .where(
+        and(sql`${agentShares.shareConfig} ->> 'slug' = ${slug}`, ne(agentShares.agentId, agentId)),
+      )
+      .limit(1);
+
+    return !!conflict;
+  };
+
+  /**
+   * Best-effort default for a brand-new share: the visitor url starts out as
+   * `/a/<the agent's own profile slug>` instead of a bare UUID. Agent
+   * slugs are unique per OWNER while share slugs are global, so a slug another
+   * share already holds — or one the share rules reject — simply leaves the
+   * seed unset; the owner can still pick any slug in the settings. Never
+   * throws: a seed failure must not fail the share creation itself.
+   */
+  private static seedSlugFromAgent = async (
+    tx: LobeChatDatabase,
+    share: AgentShareItem,
+    agentSlug: string | null,
+  ): Promise<AgentShareItem> => {
+    const slug = agentSlug?.trim().toLowerCase();
+    if (!slug || getShareSlugRejection(slug)) return share;
+    if (await AgentShareModel.isShareSlugTaken(tx, slug, share.agentId)) return share;
+
+    const [updated] = await tx
+      .update(agentShares)
+      .set({
+        shareConfig: sql<AgentShareConfig>`COALESCE(${agentShares.shareConfig}, '{}'::jsonb) || ${JSON.stringify({ slug })}::jsonb`,
+      })
+      .where(eq(agentShares.id, share.id))
+      .returning();
+
+    return updated ?? share;
   };
 
   private withOwnedPersonalAgentLock = async <T>(
@@ -125,7 +197,7 @@ export class AgentShareModel {
 
   /** Create a private share by default, or return the existing share for the agent. */
   create = async (agentId: string, visibility: ShareVisibility = 'private') => {
-    const share = await this.withOwnedPersonalAgentLock(agentId, async (tx) => {
+    const share = await this.withOwnedPersonalAgentLock(agentId, async (tx, agent) => {
       // One row per agent, forever: `onConflictDoNothing` on `agentId` makes a
       // re-enable fall back to the SELECT below, returning the existing row
       // untouched. That is what keeps a share's id and custom slug — i.e. the
@@ -137,7 +209,9 @@ export class AgentShareModel {
         .onConflictDoNothing({ target: agentShares.agentId })
         .returning();
 
-      if (created) return created;
+      // Only a freshly minted row gets the profile-slug default; an existing
+      // row keeps whatever slug (or none) its owner already chose.
+      if (created) return AgentShareModel.seedSlugFromAgent(tx, created, agent.slug);
 
       const [existing] = await tx
         .select()
@@ -264,32 +338,13 @@ export class AgentShareModel {
       });
     }
 
-    // A UUID-shaped slug would be unreachable: `findBySlugOrId` resolves
-    // UUID-shaped input as a share id before ever trying the slug lookup.
-    if (!AGENT_SHARE_SLUG_PATTERN.test(slug) || isUuid(slug)) {
-      throw new TRPCError({ code: 'BAD_REQUEST', message: 'INVALID_SHARE_SLUG' });
-    }
-
-    if (RESERVED_AGENT_SHARE_SLUGS.includes(slug)) {
-      throw new TRPCError({ code: 'BAD_REQUEST', message: 'RESERVED_SHARE_SLUG' });
+    const rejection = getShareSlugRejection(slug);
+    if (rejection) {
+      throw new TRPCError({ code: 'BAD_REQUEST', message: rejection });
     }
 
     return this.withOwnedPersonalAgentLock(agentId, async (tx) => {
-      // Cross-agent uniqueness barrier: released automatically at commit/rollback.
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`agent_share_slug:${slug}`}))`);
-
-      const [conflict] = await tx
-        .select({ id: agentShares.id })
-        .from(agentShares)
-        .where(
-          and(
-            sql`${agentShares.shareConfig} ->> 'slug' = ${slug}`,
-            ne(agentShares.agentId, agentId),
-          ),
-        )
-        .limit(1);
-
-      if (conflict) {
+      if (await AgentShareModel.isShareSlugTaken(tx, slug, agentId)) {
         throw new TRPCError({ code: 'CONFLICT', message: 'SHARE_SLUG_TAKEN' });
       }
 
@@ -429,9 +484,18 @@ export class AgentShareModel {
         agentDescription: agents.description,
         agentId: agentShares.agentId,
         agentName: agents.name,
+        agentOpeningQuestions: agents.openingQuestions,
         agentSlug: agents.slug,
+        agentTags: agents.tags,
         agentTitle: agents.title,
+        // Creator identity for the visitor-facing profile. Left-joined on the
+        // owner rather than read through a second query: the share page needs
+        // it on its only round trip, and the row is already joined for the
+        // personal-scope guard below.
+        ownerAvatar: users.avatar,
+        ownerFullName: users.fullName,
         ownerId: agents.userId,
+        ownerUsername: users.username,
         shareConfig: agentShares.shareConfig,
         shareId: agentShares.id,
         userViewCount: agentShares.userViewCount,
@@ -439,6 +503,7 @@ export class AgentShareModel {
       })
       .from(agentShares)
       .innerJoin(agents, eq(agentShares.agentId, agents.id))
+      .leftJoin(users, eq(agents.userId, users.id))
       .where(and(eq(agentShares.id, shareId), isNull(agents.workspaceId)))
       .limit(1);
 
@@ -447,6 +512,8 @@ export class AgentShareModel {
     return {
       ...share,
       agentAvatar: normalizeInboxAgentAvatar(share.agentAvatar, { slug: share.agentSlug }),
+      agentOpeningQuestions: share.agentOpeningQuestions ?? [],
+      agentTags: share.agentTags ?? [],
       agentTitle: normalizeInboxAgentTitle(share.agentTitle, { slug: share.agentSlug }),
       shareConfig: normalizeAgentShareConfig(share.shareConfig),
     };

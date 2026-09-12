@@ -42,12 +42,16 @@ const Body = memo(() => {
       style={{ minHeight: 0, overflowY: 'auto' }}
     >
       {isInitialLoading ? (
-        <TaskDetailSkeleton />
+        <TaskDetailSkeleton chrome={'body'} />
       ) : (
         <>
+          {/* Report, then the verdict on it, then the artifacts it produced.
+              The acceptance used to sit last, so on any report longer than a
+              screen the checks — the reason to trust what you just read — were
+              off the bottom of the panel and read as missing. */}
           <TaskActivities variant={'result'} />
+          <TaskAcceptance variant={'result'} />
           <TaskArtifacts />
-          <TaskAcceptance />
         </>
       )}
       <TopicChatDrawer />

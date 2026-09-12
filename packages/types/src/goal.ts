@@ -1,4 +1,5 @@
 import type { InitialGoalOverviewContext } from './stepContext';
+import type { AcceptanceStatus } from './verify';
 import type { WorkType } from './work';
 
 // ============================================
@@ -72,6 +73,8 @@ export interface GoalMetricCriterion {
   /** Defaults to `gte` — the "reach this number" case. */
   op?: GoalMetricComparison;
   target: number;
+  /** Human-facing name shown on tracking surfaces; the key stays the address. */
+  title?: string;
 }
 
 /**
@@ -101,10 +104,144 @@ export interface GoalAcceptancePolicy {
  * stored explicitly rather than as the absence of a marker, because pausing an
  * already-paused goal is a no-op that leaves no other trace of who asked.
  */
-export type GoalPauseReason = 'measured_acceptance' | 'user';
+export type GoalPauseReason =
+  | 'measured_acceptance'
+  | 'exploration_limit'
+  /** The planner asked for a correction after its allowance was already spent. */
+  | 'exploration_revision_limit'
+  | 'user';
+
+export interface GoalExplorationDecision {
+  /**
+   * `expand` opens a sibling experiment for a new question; `revise` corrects the
+   * protocol of an experiment that already ran, so a flawed instrument is fixed in
+   * place instead of being inherited by another sibling.
+   */
+  action: 'expand' | 'revise' | 'verify';
+  instruction: string;
+  parentNodeId: string;
+  reason: string;
+  title: string;
+}
+
+/** Opt-in, bounded graph exploration. Runtime checkpoint is coordinator-owned. */
+export interface GoalExplorationConfig {
+  checkpoint?: {
+    token: string;
+    snapshot: string;
+    expiresAt: string;
+    readyForAcceptance?: boolean;
+    reviewedNodeIds?: string[];
+  };
+  instruction: string;
+  maxExperiments: number;
+}
+
+/** Opt-in recovery supervision. It cannot grant new permissions or expand budgets. */
+export interface GoalSupervisionPolicy {
+  enabled: boolean;
+  /** Bounded incident ledger and paid diagnostic runs per Goal (default 10, maximum 100). */
+  maxIncidents?: number;
+}
+
+export interface GoalSupervisionIncident {
+  createdAt: string;
+  eligible: boolean;
+  failedOperationId: string;
+  id: string;
+  /** Server-recorded tool inspections and recovery request for this incident. */
+  inspected?: { goal?: boolean; task?: boolean; artifactVersionIds?: string[] };
+  nodeId: string;
+  reason: string;
+  recoveryInstruction?: string;
+  recoveryOperationId?: string;
+  resolution?: {
+    action: 'retry' | 'escalate';
+    instruction: string;
+    reason: string;
+    toolCallId: string;
+  };
+  resolvedAt?: string;
+  status: 'diagnosing' | 'retrying' | 'recovered' | 'escalated' | 'unsuccessful' | 'human_resumed';
+  supervisorOperationId?: string;
+  taskId: string;
+  /**
+   * Status the Task held when this incident opened. A diagnosis runs for minutes, so
+   * the recovery claims against this rather than a later read: anything a person did
+   * in between must win, not be swapped back into work.
+   */
+  taskStatus?: string;
+}
+
+/** Server-owned state; never accepted as client configuration. */
+export interface GoalSupervisionState {
+  agentId: string;
+  incidents: GoalSupervisionIncident[];
+  revision: number;
+  topicId: string;
+}
+
+export interface GoalSupervisionSummary {
+  effectiveRecoveries: number;
+  /** Null when no eligible interruption has been observed. */
+  effectiveRecoveryRate: number | null;
+  eligibleInterruptions: number;
+  escalated: number;
+  interruptions: number;
+  pendingRecoveries: number;
+}
+
+export const summarizeGoalSupervision = (state?: GoalSupervisionState): GoalSupervisionSummary => {
+  const incidents = state?.incidents ?? [];
+  const eligibleInterruptions = incidents.filter((item) => item.eligible).length;
+  const effectiveRecoveries = incidents.filter(
+    (item) => item.eligible && item.status === 'recovered',
+  ).length;
+  return {
+    effectiveRecoveries,
+    effectiveRecoveryRate: eligibleInterruptions
+      ? effectiveRecoveries / eligibleInterruptions
+      : null,
+    eligibleInterruptions,
+    escalated: incidents.filter((item) => item.status === 'escalated').length,
+    interruptions: incidents.length,
+    pendingRecoveries: incidents.filter((item) => ['diagnosing', 'retrying'].includes(item.status))
+      .length,
+  };
+};
+
+/** A CLI-capable agent owns planning; the coordinator owns execution and acceptance. */
+export interface GoalManagerPolicy {
+  /** Server-resolved creator identity; not a separately selectable manager. */
+  agentId: string;
+  instruction?: string;
+  maxTurns?: number;
+}
+
+/** Server-owned dispatch receipt, retained across backend restarts. */
+export interface GoalManagerState {
+  consumed?: boolean;
+  operationId?: string;
+  readyForAcceptance?: boolean;
+  reviewSnapshot?: string;
+  snapshot: string;
+  startedAt: string;
+  submitted?: {
+    action: 'tasks' | 'verify' | 'retry' | 'escalate';
+    reason: string;
+    taskId?: string;
+  };
+  token: string;
+  topicId: string;
+  turns: number;
+}
 
 export interface GoalConfig {
   acceptance?: GoalAcceptancePolicy;
+
+  exploration?: GoalExplorationConfig;
+  manager?: GoalManagerPolicy;
+  managerState?: GoalManagerState;
   /**
    * How many of a goal's Tasks may be in flight at once. Independent Tasks are
    * the common case — four bug fixes that share no code have no reason to run
@@ -114,9 +251,21 @@ export interface GoalConfig {
   maxConcurrentTasks?: number | null;
   /** Who the current pause belongs to; cleared when the goal runs again. */
   pausedBy?: GoalPauseReason;
+  /** Coordinator-owned lease for initial decomposition; not a user policy. */
+  planningCheckpoint?: { expiresAt: string; token: string };
+  /** Retained after release to distinguish lease-aware retries from legacy planners. */
+  planningProtocol?: 'lease-v1';
   recovery?: GoalRecoveryPolicy;
   schedule?: GoalSchedulePolicy;
+  supervision?: GoalSupervisionPolicy;
+  /** Durable supervisor topic and bounded incident ledger. */
+  supervisorState?: GoalSupervisionState;
 }
+
+/** Creation accepts planning options, never a separate manager identity or runtime receipt. */
+export type GoalCreateConfig = Omit<GoalConfig, 'manager' | 'managerState' | 'supervisorState'> & {
+  manager?: Omit<GoalManagerPolicy, 'agentId'>;
+};
 
 /**
  * The goal entity as exposed to clients — a mirror of the `goals` table row.
@@ -151,7 +300,7 @@ export interface GoalItem {
 // ============================================
 
 /** Coarse-grained semantic role of a node in a Goal Graph. */
-export type GoalNodeKind = 'problem' | 'task' | 'finding' | 'decision';
+export type GoalNodeKind = 'problem' | 'experiment' | 'task' | 'finding' | 'decision';
 
 /** Semantic lifecycle of a node; independent from the execution status of its Task. */
 export type GoalNodeStatus =
@@ -159,8 +308,18 @@ export type GoalNodeStatus =
 
 /** How two Goal Graph nodes are related. */
 export type GoalEdgeKind =
+  | 'contains'
+  | 'answers'
   | 'decomposes'
   | 'depends_on'
+  | 'derived_from'
+  /**
+   * A corrected protocol replacing an earlier one inside the same experiment.
+   * Distinct from `derived_from`, which records generic provenance and is writable
+   * through the public graph mutation: reusing it would silently reinterpret any
+   * hand-authored task provenance as a correction.
+   */
+  | 'revises'
   | 'investigates'
   | 'produces'
   | 'supports'
@@ -296,8 +455,28 @@ export interface GoalGraphWorkVersionDisplay {
   workId: string;
 }
 
+/** Where a task node's own verification stands, for a reader scanning the goal. */
+export interface GoalNodeAcceptance {
+  id: string;
+  status: AcceptanceStatus;
+}
+
 export interface GoalGraphSnapshot {
+  /**
+   * Verification state per task node, keyed by node id. Every dispatched task
+   * gets its own Acceptance, but the goal used to show only the standard it was
+   * judged against and never the judgment — so the page could say a task
+   * finished without saying whether it held up.
+   */
+  acceptances?: Record<string, GoalNodeAcceptance>;
   decisions: GoalGraphDecision[];
+  /**
+   * When an active task node's newest run delivered, present only while that
+   * node is waiting on verification to settle. A verify-bound task holds its
+   * node `active` with an already-`completed` topic, which contributes no
+   * heartbeat — without this the client reads the wait as lost.
+   */
+  deliveredAt?: Record<string, Date>;
   edges: GoalGraphEdge[];
   events: GoalGraphEvent[];
   goal: GoalItem;
@@ -309,7 +488,36 @@ export interface GoalGraphSnapshot {
    * liveness judgements must use whichever of the two is newer.
    */
   runHeartbeats?: Record<string, Date>;
+  /**
+   * Rounds run and dollars spent so far, by the definition the coordinator
+   * enforces the budget against. Present on a fetched graph; absent on the
+   * snapshots the write paths return.
+   */
+  spend?: GoalSpend;
   workVersions: GoalGraphWorkVersionLink[];
+}
+
+/** What a goal has spent against what it is allowed to spend. */
+export interface GoalSpend {
+  /**
+   * The same spend split per Task node, so the cost panel can say WHERE the
+   * money went rather than only how much is left.
+   */
+  byTask: GoalTaskSpend[];
+  /** Runs the graph's Task nodes produced — what `maxRounds` is counted in. */
+  runs: number;
+  /** USD across those runs; a run that has not settled contributes 0. */
+  totalCost: number;
+  /** Tokens across those runs; a run that has not settled contributes 0. */
+  totalTokens: number;
+}
+
+/** One Task's share of a goal's spend. */
+export interface GoalTaskSpend {
+  runs: number;
+  taskId: string;
+  totalCost: number;
+  totalTokens: number;
 }
 
 /**

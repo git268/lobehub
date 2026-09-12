@@ -4,7 +4,7 @@ import { Flexbox, Form } from '@lobehub/ui';
 import { Switch } from '@lobehub/ui/base-ui';
 import { Form as AntdForm } from 'antd';
 import isEqual from 'fast-deep-equal';
-import { MODEL_REASONING_EXTEND_PARAMS } from 'model-bank';
+import { MODEL_REASONING_EXTEND_PARAMS } from 'model-bank/aiModel';
 import type { ReactNode } from 'react';
 import { memo, useEffect, useMemo } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
@@ -45,6 +45,7 @@ import ImageResolution2Slider from './ImageResolution2Slider';
 import ImageResolutionSlider from './ImageResolutionSlider';
 import { KimiK3ReasoningEffortSlider } from './KimiK3ReasoningEffortSlider';
 import Opus47EffortSlider from './Opus47EffortSlider';
+import Qwen38ReasoningEffortSlider from './Qwen38ReasoningEffortSlider';
 import ReasoningEffortSlider from './ReasoningEffortSlider';
 import ReasoningModeSegmented from './ReasoningModeSegmented';
 import ReasoningTokenSlider from './ReasoningTokenSlider';
@@ -268,6 +269,16 @@ const ControlsForm = memo<ControlsFormProps>(
         layout: 'vertical',
         minWidth: undefined,
         name: 'deepseekV4ReasoningEffort',
+        style: {
+          paddingBottom: 0,
+        },
+      },
+      {
+        children: <Qwen38ReasoningEffortSlider />,
+        label: t('extendParams.reasoningEffort.title'),
+        layout: 'vertical',
+        minWidth: undefined,
+        name: 'qwen38ReasoningEffort',
         style: {
           paddingBottom: 0,
         },

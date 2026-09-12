@@ -1,3 +1,4 @@
+import { GOAL_ACCEPTANCE_TASK_TITLE } from '@lobechat/const/goal';
 import type {
   GoalGraphDecision,
   GoalGraphEdge,
@@ -8,7 +9,13 @@ import type {
 } from '@lobechat/types';
 import { describe, expect, it } from 'vitest';
 
-import { buildGoalGraphView } from './goalGraphViewModel';
+import { experimentRelations, graphNodeKind, isExperiment } from '../Experiments/model';
+import {
+  buildGoalGraphView,
+  hasReviewableResult,
+  isRunningNode,
+  isTroubledTaskNode,
+} from './goalGraphViewModel';
 
 const T0 = new Date('2026-08-01T00:00:00Z');
 const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
@@ -168,6 +175,60 @@ describe('buildGoalGraphView', () => {
     expect(view.byId.w1.isStale).toBe(true);
     expect(view.frontier[0]).toMatchObject({ kind: 'stale', rank: 0 });
     expect(view.needsYou).toBe(1);
+  });
+
+  it('reads a delivered task as verifying, not lost, while the judgment settles', () => {
+    // A verify-bound task keeps its node `active` with an already-`completed`
+    // topic, so it contributes no heartbeat and the node row goes quiet. The
+    // coordinator deliberately leaves it alone for a full hour; the UI used to
+    // spend that hour showing a failure-coloured "lost" badge over the most
+    // informative moment of the run.
+    const view = buildGoalGraphView(
+      snapshot({
+        deliveredAt: { w1: at(90) },
+        events: [event('w1', 'activated', 30)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(30) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1).toMatchObject({ isStale: false, isVerifying: true });
+    // In flight, not something the reader has to deal with.
+    expect(view.frontier[0]).toMatchObject({ kind: 'verifying', rank: 1 });
+    expect(view.needsYou).toBe(0);
+  });
+
+  it('never calls a node lost while its own acceptance says it is being judged', () => {
+    // The settle window and the acceptance row are two views of one fact. Read
+    // separately, an aged delivery timestamp put a red "lost" badge on the same
+    // row as a "verifying" chip — a contradiction the reader has no way to
+    // resolve.
+    const view = buildGoalGraphView(
+      snapshot({
+        acceptances: { w1: { id: 'acc-1', status: 'verifying' } },
+        deliveredAt: { w1: at(30) },
+        events: [event('w1', 'activated', 30)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(30) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1).toMatchObject({ isStale: false, isVerifying: true });
+  });
+
+  it('gives up on a delivery the coordinator itself would no longer wait for', () => {
+    // Past the coordinator's settle grace the verify run really is stuck, and
+    // the honest reading flips back to lost.
+    const view = buildGoalGraphView(
+      snapshot({
+        deliveredAt: { w1: at(30) },
+        events: [event('w1', 'activated', 30)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(30) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1).toMatchObject({ isStale: true, isVerifying: false });
   });
 
   it('keeps a task running when the run operation heartbeat is fresh despite a quiet node row', () => {
@@ -451,5 +512,208 @@ describe('buildGoalGraphView', () => {
 
     expect(view.byId.w1.artifacts).toEqual([]);
     expect(view.artifacts).toEqual([]);
+  });
+});
+
+describe('isTroubledTaskNode', () => {
+  // A healthy Task opens on its result surface; a broken one has no result
+  // worth reviewing, so the drill-down goes to the original Task instead.
+  it('flags a task that lost its heartbeat', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('w1', { status: 'active', updatedAt: at(0) })] }),
+      NOW,
+    );
+
+    expect(view.byId.w1.isStale).toBe(true);
+    expect(isTroubledTaskNode(view.byId.w1)).toBe(true);
+  });
+
+  it('flags a task whose latest attempt failed', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 100), event('w1', 'rejected', 110)],
+        nodes: [node('w1', { status: 'rejected', updatedAt: at(110) })],
+      }),
+      NOW,
+    );
+
+    expect(isTroubledTaskNode(view.byId.w1)).toBe(true);
+  });
+
+  it('leaves a healthy running task alone', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 110)],
+        nodes: [node('w1', { status: 'active', updatedAt: at(115) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1.isStale).toBe(false);
+    expect(isTroubledTaskNode(view.byId.w1)).toBe(false);
+  });
+
+  it('leaves a finished task alone — its result is the thing to read', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 100), event('w1', 'resolved', 110)],
+        nodes: [node('w1', { resolvedAt: at(110), status: 'resolved', updatedAt: at(110) })],
+      }),
+      NOW,
+    );
+
+    expect(isTroubledTaskNode(view.byId.w1)).toBe(false);
+  });
+
+  it('is not a judgement about non-task nodes', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('p1', { kind: 'problem', status: 'active', updatedAt: at(0) })] }),
+      NOW,
+    );
+
+    expect(isTroubledTaskNode(view.byId.p1)).toBe(false);
+  });
+});
+
+describe('isRunningNode', () => {
+  it('reads an active task as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 110)],
+        nodes: [node('w1', { status: 'active', updatedAt: at(115) })],
+      }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.w1)).toBe(true);
+  });
+
+  // An open question is not work in flight — the card already says it is
+  // unanswered, and a running chip there promises activity nobody is doing.
+  it('never reads a question as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('p1', { kind: 'problem', status: 'active', updatedAt: at(115) })] }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.p1)).toBe(false);
+  });
+
+  it('does not read a stale task as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('w1', { status: 'active', updatedAt: at(0) })] }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.w1)).toBe(false);
+  });
+});
+
+describe('hasReviewableResult', () => {
+  // The graph drill-down routes on this: only a Task with a delivery to read
+  // opens the result surface; everything else opens the original Task detail.
+  it('keeps a healthy running task on the detail surface — its result panel would be empty', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 110)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(115) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1.isStale).toBe(false);
+    expect(hasReviewableResult(view.byId.w1)).toBe(false);
+  });
+
+  it('keeps an undispatched task on the detail surface', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('w1', { status: 'proposed', taskId: 'task-1' })] }),
+      NOW,
+    );
+
+    expect(hasReviewableResult(view.byId.w1)).toBe(false);
+  });
+
+  it('opens the result surface once the task settled', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 100), event('w1', 'resolved', 110)],
+        nodes: [
+          node('w1', {
+            resolvedAt: at(110),
+            status: 'resolved',
+            taskId: 'task-1',
+            updatedAt: at(110),
+          }),
+        ],
+      }),
+      NOW,
+    );
+
+    expect(hasReviewableResult(view.byId.w1)).toBe(true);
+  });
+
+  it('opens the result surface while a delivery is being judged — the acceptance lives there', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        acceptances: { w1: { id: 'acc-1', status: 'verifying' } },
+        deliveredAt: { w1: at(30) },
+        events: [event('w1', 'activated', 30)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(30) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1.isVerifying).toBe(true);
+    expect(hasReviewableResult(view.byId.w1)).toBe(true);
+  });
+
+  it('never opens the result surface on a troubled task, even a stale delivered one', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 30)],
+        nodes: [node('w1', { status: 'active', taskId: 'task-1', updatedAt: at(0) })],
+      }),
+      NOW,
+    );
+
+    expect(view.byId.w1.isStale).toBe(true);
+    expect(hasReviewableResult(view.byId.w1)).toBe(false);
+  });
+});
+
+describe('experiment navigation', () => {
+  it('keeps historical branching separate from dependencies and excludes terminal acceptance', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        goal: goal({ config: { exploration: { instruction: 'Compare', maxExperiments: 3 } } }),
+        nodes: [
+          node('first', { kind: 'experiment' }),
+          node('second', { kind: 'experiment' }),
+          node('third', { kind: 'experiment' }),
+          node('acceptance', { title: GOAL_ACCEPTANCE_TASK_TITLE }),
+        ],
+        edges: [
+          edge('second', 'first', 'derived_from'),
+          edge('third', 'first', 'derived_from'),
+          edge('third', 'second', 'depends_on'),
+        ],
+      }),
+      NOW,
+    );
+    expect(experimentRelations(view, 'third').parents.map((v) => v.node.id)).toEqual(['first']);
+    expect(experimentRelations(view, 'first').children.map((v) => v.node.id)).toEqual([
+      'second',
+      'third',
+    ]);
+    expect(graphNodeKind(view, view.byId.first)).toBe('experiment');
+    expect(graphNodeKind(view, view.byId.acceptance)).toBe('task');
+    expect(isExperiment(view, view.byId.acceptance)).toBe(false);
+    expect(view.nodes.filter((v) => isExperiment(view, v))).toHaveLength(3);
+  });
+  it('does not reclassify ordinary Goal tasks as experiments', () => {
+    const view = buildGoalGraphView(snapshot({ nodes: [node('task')] }), NOW);
+    expect(graphNodeKind(view, view.byId.task)).toBe('task');
+    expect(isExperiment(view, view.byId.task)).toBe(false);
   });
 });

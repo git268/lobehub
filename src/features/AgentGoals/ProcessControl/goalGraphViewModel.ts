@@ -5,8 +5,10 @@ import type {
   GoalGraphNode,
   GoalGraphSnapshot,
   GoalItem,
+  GoalNodeAcceptance,
   WorkType,
 } from '@lobechat/types';
+import { experimentMembers } from '@lobechat/utils/goalGraph';
 
 /**
  * Read model for the Goal process-control surface.
@@ -21,6 +23,9 @@ import type {
 
 /** Mirrors the reclaim window the coordinator uses when a Task holds no lease. */
 const DEFAULT_LEASE_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** Mirrors the coordinator's grace period for a delivered task's verification. */
+const VERIFY_SETTLE_GRACE_MS = 60 * 60 * 1000;
 
 /** How many just-finished tasks stay visible so the list fades instead of items vanishing. */
 export const RECENT_DONE = 2;
@@ -65,6 +70,8 @@ export interface GoalArtifactView {
 }
 
 export interface GoalNodeView {
+  /** This task's own verification, when it has been dispatched. */
+  acceptance?: GoalNodeAcceptance;
   /** Problems this finding was linked to with a `supports` edge. */
   answers: GoalGraphNode[];
   /** Deliverables this node produced, newest first. */
@@ -85,6 +92,8 @@ export interface GoalNodeView {
   humanTouches: GoalGraphDecision[];
   /** Active for longer than the lease window with no heartbeat — the coordinator would reclaim it. */
   isStale: boolean;
+  /** Delivered and waiting for its Acceptance judgment to settle. */
+  isVerifying: boolean;
   node: GoalGraphNode;
   /** The Task that produced this finding. */
   producedBy?: GoalGraphNode;
@@ -94,7 +103,49 @@ export interface GoalNodeView {
   startedAt?: Date;
 }
 
-export type FrontierItemKind = 'gate' | 'stale' | 'running' | 'ready' | 'done';
+/**
+ * Whether a Task node is in trouble — lost its heartbeat, or its latest attempt
+ * failed / was rejected.
+ *
+ * A healthy Task opens on its result surface: the delivery is the thing to read
+ * and the implementation metadata stays one step deeper. A broken one inverts
+ * that — there is no result worth reviewing, and the question is what the run
+ * actually did — so it opens the original Task instead.
+ */
+export const isTroubledTaskNode = (view: GoalNodeView): boolean => {
+  if (view.node.kind !== 'task') return false;
+  if (view.isStale) return true;
+  if (view.node.status === 'rejected') return true;
+  return view.attempts.at(-1)?.outcome === 'failed';
+};
+
+/**
+ * Whether a Task node has a delivery worth opening the result surface on: it
+ * settled successfully, or it delivered and its Acceptance is being judged.
+ * A Task that is still running (or was never dispatched) has no result yet —
+ * opening the result panel there shows an empty shell, so those open the
+ * original Task detail, where progress and configuration live.
+ */
+export const hasReviewableResult = (view: GoalNodeView): boolean => {
+  if (view.node.kind !== 'task') return false;
+  if (isTroubledTaskNode(view)) return false;
+  return view.node.status === 'resolved' || view.isVerifying;
+};
+
+/**
+ * Whether a node reads as "running" on the map — the animated ring, the chip
+ * and the elapsed clock all hang off this.
+ *
+ * A question is excluded: an open question is not work in flight, its state is
+ * whether it has an answer yet, and the card already says that. A "Running"
+ * chip on a question that nobody is working promises activity that isn't there.
+ */
+export const isRunningNode = (view: GoalNodeView): boolean => {
+  if (view.node.kind === 'problem') return false;
+  return view.node.status === 'active' && !view.isStale;
+};
+
+export type FrontierItemKind = 'gate' | 'stale' | 'verifying' | 'running' | 'ready' | 'done';
 
 export interface FrontierItem {
   key: string;
@@ -211,7 +262,17 @@ export const buildGoalGraphView = (
   snapshot: GoalGraphSnapshot,
   now: number = Date.now(),
 ): GoalGraphView => {
-  const { decisions, edges, events, goal, nodes, runHeartbeats, workVersions } = snapshot;
+  const {
+    acceptances,
+    decisions,
+    deliveredAt,
+    edges,
+    events,
+    goal,
+    nodes,
+    runHeartbeats,
+    workVersions,
+  } = snapshot;
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const lease = leaseTimeoutMs(goal);
 
@@ -269,7 +330,10 @@ export const buildGoalGraphView = (
     ]);
 
   let seq = 0;
+  let experimentSeq = 0;
   const views: GoalNodeView[] = nodes.map((node) => {
+    const members =
+      node.kind === 'experiment' ? experimentMembers(snapshot, node.id) : new Set<string>();
     const nodeDecisions = decisionsByNode.get(node.id) ?? [];
     const attempts = buildAttempts(node, events);
     const open = attempts.at(-1);
@@ -282,24 +346,53 @@ export const buildGoalGraphView = (
     const heartbeatAt = new Date(
       Math.max(node.updatedAt.getTime(), runHeartbeats?.[node.id]?.getTime() ?? 0),
     );
+    // A delivered run contributes no heartbeat — its topic is `completed`, not
+    // running — so liveness alone would call the verification window lost. That
+    // window is where the goal is most informative, and it lasted up to an hour
+    // showing a failure-coloured "lost" badge.
+    const delivered = deliveredAt?.[node.id];
+    // Two independent signals say a delivery is being judged: the coordinator's
+    // own settle window, and the acceptance row's status. They must not be read
+    // separately — a graph whose delivery timestamp had aged past the window
+    // while its acceptance still said `verifying` rendered a red "lost" badge
+    // next to a "verifying" chip on the same row, which cannot both be true.
+    const acceptanceVerifying =
+      acceptances?.[node.id]?.status === 'verifying' ||
+      acceptances?.[node.id]?.status === 'repairing';
+    const isVerifying =
+      node.kind === 'task' &&
+      node.status === 'active' &&
+      (acceptanceVerifying || (!!delivered && now - delivered.getTime() <= VERIFY_SETTLE_GRACE_MS));
+
     return {
       answers: supportsByFinding.get(node.id) ?? [],
-      artifacts: artifactsByNode.get(node.id) ?? [],
+      artifacts:
+        node.kind === 'experiment'
+          ? [...members].flatMap((id) => artifactsByNode.get(id) ?? [])
+          : (artifactsByNode.get(node.id) ?? []),
+      ...(acceptances?.[node.id] ? { acceptance: acceptances[node.id] } : {}),
       attempts,
       blockers: (dependsOn.get(node.id) ?? [])
         .map((id) => nodeById.get(id))
         .filter((dep): dep is GoalGraphNode => !!dep && !TERMINAL_NODE_STATUSES.has(dep.status)),
       decision: nodeDecisions.find((d) => d.status === 'pending'),
       dependsOn: dependsOn.get(node.id) ?? [],
-      findings: producesByTask.get(node.id) ?? [],
+      findings:
+        node.kind === 'experiment'
+          ? nodes.filter((item) => members.has(item.id) && item.kind === 'finding')
+          : (producesByTask.get(node.id) ?? []),
       gateSubjectId: gateSubject.get(node.id),
       heartbeatAt,
       humanTouches: nodeDecisions.filter((d) => d.status === 'resolved' && !!d.resolvedByUserId),
       isStale:
-        node.kind === 'task' && node.status === 'active' && now - heartbeatAt.getTime() > lease,
+        node.kind === 'task' &&
+        node.status === 'active' &&
+        !isVerifying &&
+        now - heartbeatAt.getTime() > lease,
+      isVerifying,
       node,
       producedBy: producedByFinding.get(node.id),
-      seq: node.kind === 'task' ? ++seq : undefined,
+      seq: node.kind === 'experiment' ? ++experimentSeq : node.kind === 'task' ? ++seq : undefined,
       startedAt: isRunningAttempt ? open.startedAt : undefined,
     };
   });
@@ -319,7 +412,7 @@ export const buildGoalGraphView = (
     if (node.status === 'active') {
       frontier.push({
         key: node.id,
-        kind: view.isStale ? 'stale' : 'running',
+        kind: view.isStale ? 'stale' : view.isVerifying ? 'verifying' : 'running',
         rank: view.isStale ? 0 : 1,
         view,
       });
